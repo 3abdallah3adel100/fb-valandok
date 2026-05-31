@@ -1,11 +1,13 @@
 {
-  "last_fetch_ts": "2026-04-29T12:39:02.663487+00:00",
-  "date_from": "2026-04-29",
-  "date_to": "2026-04-29",
-  "accounts_count": 90,
-  "rows_count": 153,
-  "errors_count": 1,
-  "errors": [
-    "Elokaby Pharmacy (Read-Only): 403 Client Error: Forbidden for url: https://graph.facebook.com/v25.0/act_915309897778995/insights?fields=account_id%2Caccount_name%2Ccampaign_id%2Ccampaign_name%2Cspend%2Cimpressions%2Cclicks%2Cctr%2Ccpc%2Cfrequency%2Cactions%2Cdate_start%2Cdate_stop&level=campaign&time_range=%7B%22since%22%3A%222026-04-29%22%2C%22until%22%3A%222026-04-29%22%7D&access_token=EAAeSMhRXuasBRfjmR8TZAseVb4kPORkyCzZC5RMPYit5ZCFYK43DumK4EPCwZBWduLNoE7Qn2BZCjXhi0Kt5X4YSrLkFmCZBbRfzMaKZBIrZBXS5BMugbbZB2abSkjbhIgJ56hEOOrOakN1pdH1pDKKCtTvCZBWO69GMMSoYkiZCjzM43VzGkvqgo4yGE9KvoCgJEaY&limit=1000"
-  ]
+  "last_fetch_ts": "2026-05-31T13:29:20.412606+00:00",
+  "date_from": "2026-05-01",
+  "date_to": "2026-05-31",
+  "accounts_count": 86,
+  "business_ids": [
+    "751488620224306",
+    "1178859133269743"
+  ],
+  "rows_count": 445,
+  "errors_count": 0,
+  "errors": []
 }
