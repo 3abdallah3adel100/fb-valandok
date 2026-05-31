@@ -11,6 +11,29 @@ from pathlib import Path
 
 st.set_page_config(page_title="Meta Ads Team Dashboard", layout="wide")
 
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+
+    if st.session_state["password_correct"]:
+        return True
+
+    st.title("🔐 Login Required")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if password == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+
+    return False
+
+
+if not check_password():
+    st.stop()
+
 BASE_URL = "https://graph.facebook.com"
 API_VERSION = st.secrets.get("META_API_VERSION", "v17.0")
 ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
