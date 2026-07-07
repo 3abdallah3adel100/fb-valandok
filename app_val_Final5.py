@@ -38,7 +38,7 @@ BASE_URL = "https://graph.facebook.com"
 API_VERSION = st.secrets.get("META_API_VERSION", "v17.0")
 ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
 BUSINESS_IDS = ["751488620224306", "1178859133269743"]
-FETCH_CAMPAIGNS = False  # Faster: insights already returns campaign_id/campaign_name
+FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
 
 DATA_DIR = Path("app_data")
@@ -149,6 +149,14 @@ def classify_objective_from_campaign_name(campaign_name: str) -> str:
     if re.search(r"(?<![A-Z0-9])LM(?![A-Z0-9])", text):
         return "Lead - Message"
 
+    return "Unknown"
+
+def campaign_status_label(status=None, effective_status=None):
+    raw = normalize_text(effective_status) or normalize_text(status)
+    if raw == "ACTIVE":
+        return "Active"
+    if raw:
+        return "Not Active"
     return "Unknown"
 
 def flatten_actions(actions):
@@ -599,12 +607,24 @@ def prepare_data(all_campaigns_df, all_insights_df):
             fact[col] = 0
 
     if not all_campaigns_df.empty:
-        campaigns_map = all_campaigns_df[["id", "name", "account_id"]].rename(
+        campaign_cols = ["id", "name", "account_id"]
+        for col in ["status", "effective_status"]:
+            if col in all_campaigns_df.columns:
+                campaign_cols.append(col)
+
+        campaigns_map = all_campaigns_df[campaign_cols].copy()
+        campaigns_map["_account_id_clean"] = campaigns_map["account_id"].apply(normalize_account_id)
+        campaigns_map = campaigns_map.drop(columns=["account_id"], errors="ignore").rename(
             columns={"id": "campaign_id", "name": "campaign_name_master"}
         )
-        fact = fact.merge(campaigns_map, on=["campaign_id", "account_id"], how="left")
+
+        fact["_account_id_clean"] = fact["account_id"].apply(normalize_account_id)
+        fact = fact.merge(campaigns_map, on=["campaign_id", "_account_id_clean"], how="left")
+        fact = fact.drop(columns=["_account_id_clean"], errors="ignore")
     else:
         fact["campaign_name_master"] = None
+        fact["status"] = None
+        fact["effective_status"] = None
 
     if "campaign_name" not in fact.columns:
         fact["campaign_name"] = fact["campaign_name_master"]
@@ -620,6 +640,15 @@ def prepare_data(all_campaigns_df, all_insights_df):
     fact["buyer_code"] = fact["account_name"].apply(extract_buyer_code)
     fact["media_buyer"] = fact["buyer_code"].map(MEDIA_BUYER_MAP).fillna("Unknown")
 
+    if "status" not in fact.columns:
+        fact["status"] = None
+    if "effective_status" not in fact.columns:
+        fact["effective_status"] = None
+
+    fact["campaign_status"] = fact.apply(
+        lambda r: campaign_status_label(r.get("status"), r.get("effective_status")),
+        axis=1,
+    )
     fact["objective_label"] = fact["campaign_name"].apply(classify_objective_from_campaign_name)
     fact["actions_map"] = fact["actions"].apply(flatten_actions)
     fact["results"] = fact.apply(lambda r: get_result_by_objective(r["objective_label"], r["actions_map"]), axis=1)
@@ -859,6 +888,7 @@ def build_campaign_details_for_agent(fact, media_buyer, objective_label=None):
     return out.rename(columns={
         "account_name": "Ad Account Name",
         "campaign_name": "Campaign",
+        "campaign_status": "Campaign Status",
         "spend": "Spent",
         "results": "Results",
         "cpl": "CPL",
@@ -884,7 +914,7 @@ def render_objective_agent_section(fact, objective_label, title, icon, key_prefi
     if campaign_df.empty:
         st.info("No campaigns found for this media buyer.")
     else:
-        cols = ["Ad Account Name", "Campaign", "Spent", "Results", "CPL", "CTR", "CPC", "Frequency", "impressions", "clicks"]
+        cols = ["Ad Account Name", "Campaign", "Campaign Status", "Spent", "Results", "CPL", "CTR", "CPC", "Frequency", "impressions", "clicks"]
         cols = [c for c in cols if c in campaign_df.columns]
         st.dataframe(format_display_df(campaign_df[cols]), use_container_width=True, hide_index=True)
 
@@ -941,12 +971,19 @@ def build_campaign_summary(fact):
         impressions = grp["impressions"].sum()
         clicks = grp["clicks"].sum()
 
+        campaign_status = "Unknown"
+        if "campaign_status" in grp.columns:
+            status_values = grp["campaign_status"].dropna().astype(str)
+            if not status_values.empty:
+                campaign_status = status_values.iloc[0]
+
         rows.append({
             "media_buyer": media_buyer,
             "objective_label": objective_label,
             "account_name": account_name,
             "campaign_id": campaign_id,
             "campaign_name": campaign_name,
+            "campaign_status": campaign_status,
             "spend": spend,
             "results": results,
             "cpl": safe_div(spend, results),
