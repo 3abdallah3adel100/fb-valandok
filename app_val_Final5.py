@@ -649,6 +649,7 @@ def prepare_data(all_campaigns_df, all_insights_df):
         lambda r: campaign_status_label(r.get("status"), r.get("effective_status")),
         axis=1,
     )
+
     fact["objective_label"] = fact["campaign_name"].apply(classify_objective_from_campaign_name)
     fact["actions_map"] = fact["actions"].apply(flatten_actions)
     fact["results"] = fact.apply(lambda r: get_result_by_objective(r["objective_label"], r["actions_map"]), axis=1)
@@ -887,6 +888,40 @@ def build_campaign_details_for_agent(fact, media_buyer, objective_label=None):
     out = build_campaign_summary(df)
     return out.rename(columns={
         "account_name": "Ad Account Name",
+        "objective_label": "Objective",
+        "campaign_name": "Campaign",
+        "campaign_status": "Campaign Status",
+        "spend": "Spent",
+        "results": "Results",
+        "cpl": "CPL",
+        "ctr": "CTR",
+        "cpc": "CPC",
+        "frequency": "Frequency",
+    })
+
+def build_unified_campaign_details(fact, media_buyer="🔵 Overall", objective_label="All", campaign_status="All"):
+    if fact.empty:
+        return pd.DataFrame()
+
+    df = fact.copy()
+
+    if media_buyer not in [None, "", "🔵 Overall", "All"]:
+        df = df[df["media_buyer"] == media_buyer]
+
+    if objective_label not in [None, "", "All"]:
+        df = df[df["objective_label"] == objective_label]
+
+    if campaign_status not in [None, "", "All"] and "campaign_status" in df.columns:
+        df = df[df["campaign_status"] == campaign_status]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    out = build_campaign_summary(df)
+    return out.rename(columns={
+        "media_buyer": "Media Buyer",
+        "objective_label": "Objective",
+        "account_name": "Ad Account Name",
         "campaign_name": "Campaign",
         "campaign_status": "Campaign Status",
         "spend": "Spent",
@@ -905,19 +940,61 @@ def render_objective_agent_section(fact, objective_label, title, icon, key_prefi
         return
     st.dataframe(format_display_df(report_df), use_container_width=True, hide_index=True)
 
-    agents = [x for x in report_df["Media Buyer"].tolist() if x != "🔵 Overall"]
-    if not agents:
-        return
+def render_media_buyer_campaign_details(fact):
     st.markdown("### 📋 Media Buyer Campaign Details")
-    selected_agent = st.selectbox("اختر Media Buyer", agents, key=f"{key_prefix}_agent")
-    campaign_df = build_campaign_details_for_agent(fact, selected_agent, objective_label)
-    if campaign_df.empty:
-        st.info("No campaigns found for this media buyer.")
+
+    if fact.empty:
+        st.info("No campaigns found.")
+        return
+
+    buyer_report = build_agent_objective_report(fact, None)
+    agents = [x for x in buyer_report["Media Buyer"].tolist() if x != "🔵 Overall"] if not buyer_report.empty else []
+    agents = ["🔵 Overall"] + agents
+
+    objective_options = ["All"] + [obj for obj in OBJECTIVE_ORDER if obj in fact["objective_label"].dropna().astype(str).unique().tolist()]
+
+    if "campaign_status" in fact.columns:
+        status_values = fact["campaign_status"].dropna().astype(str).unique().tolist()
     else:
-        cols = ["Ad Account Name", "Campaign", "Campaign Status", "Spent", "Results", "CPL", "CTR", "CPC", "Frequency", "impressions", "clicks"]
+        status_values = []
+    preferred_status_order = ["Active", "Not Active", "Unknown"]
+    status_options = ["All"] + [s for s in preferred_status_order if s in status_values]
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        selected_agent = st.selectbox("اختر Media Buyer", agents, key="campaign_details_agent")
+    with f2:
+        selected_objective = st.selectbox("اختر Objective", objective_options, key="campaign_details_objective")
+    with f3:
+        selected_status = st.selectbox("Campaign Status", status_options, key="campaign_details_status")
+
+    campaign_df = build_unified_campaign_details(
+        fact,
+        media_buyer=selected_agent,
+        objective_label=selected_objective,
+        campaign_status=selected_status,
+    )
+
+    if campaign_df.empty:
+        st.info("No campaigns found for the selected filters.")
+    else:
+        cols = [
+            "Ad Account Name",
+            "Media Buyer",
+            "Objective",
+            "Campaign",
+            "Campaign Status",
+            "Spent",
+            "Results",
+            "CPL",
+            "CTR",
+            "CPC",
+            "Frequency",
+            "impressions",
+            "clicks",
+        ]
         cols = [c for c in cols if c in campaign_df.columns]
         st.dataframe(format_display_df(campaign_df[cols]), use_container_width=True, hide_index=True)
-
 
 def render_overall_agent_section(fact):
     st.subheader("👥 Overall Agent")
@@ -931,14 +1008,6 @@ def render_overall_agent_section(fact):
     if not agent_obj.empty:
         st.markdown(f"### {selected_agent} - Objectives")
         st.dataframe(format_display_df(agent_obj[["objective_label", "spend", "results", "campaigns", "cpl", "ctr", "cpc"]]), use_container_width=True, hide_index=True)
-    campaign_df = build_campaign_details_for_agent(fact, selected_agent, None)
-    st.markdown("### Campaigns")
-    if campaign_df.empty:
-        st.info("No campaigns found for this media buyer.")
-    else:
-        cols = ["Ad Account Name", "objective_label", "Campaign", "Spent", "Results", "CPL", "CTR", "CPC", "Frequency", "impressions", "clicks"]
-        cols = [c for c in cols if c in campaign_df.columns]
-        st.dataframe(format_display_df(campaign_df[cols]), use_container_width=True, hide_index=True)
 
 def build_buyer_objective_summary(fact):
     out = (
@@ -1472,81 +1541,31 @@ if show_account_sources:
 
 st.divider()
 
-st.subheader("📋 Media Buyer Campaign Details")
+objective_tabs = st.tabs([
+    "🎯 Lead Generation",
+    "💬 Lead Message",
+    "📱 WhatsApp",
+    "🛒 Conversion",
+    "👥 Overall Agent",
+])
 
-if filtered_fact_main.empty:
-    st.info("No campaign data found for the selected business unit.")
-else:
-    agent_options = ["🔵 Overall"] + sorted(
-        [x for x in filtered_fact_main["media_buyer"].dropna().astype(str).unique().tolist() if x]
-    )
+with objective_tabs[0]:
+    render_objective_agent_section(filtered_fact_main, "Lead generation", "Lead Generation — CPL (EGP)", "🎯", "lg")
 
-    available_objectives = filtered_fact_main["objective_label"].dropna().astype(str).unique().tolist()
-    objective_options = ["All"] + [obj for obj in OBJECTIVE_ORDER if obj in available_objectives]
-    extra_objectives = sorted([obj for obj in available_objectives if obj not in OBJECTIVE_ORDER])
-    objective_options.extend(extra_objectives)
+with objective_tabs[1]:
+    render_objective_agent_section(filtered_fact_main, "Lead - Message", "Lead Message — CPL (EGP)", "💬", "lm")
 
-    available_statuses = filtered_fact_main["campaign_status"].dropna().astype(str).unique().tolist() if "campaign_status" in filtered_fact_main.columns else []
-    status_options = ["All"] + [s for s in ["Active", "Not Active", "Unknown"] if s in available_statuses]
-    extra_statuses = sorted([s for s in available_statuses if s not in status_options])
-    status_options.extend(extra_statuses)
+with objective_tabs[2]:
+    render_objective_agent_section(filtered_fact_main, "Whatsapp Message", "WhatsApp — CPL (EGP)", "📱", "wa")
 
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    with filter_col1:
-        selected_agent = st.selectbox("Media Buyer", agent_options, key="single_campaign_details_agent")
-    with filter_col2:
-        selected_objective = st.selectbox("Objective", objective_options, key="single_campaign_details_objective")
-    with filter_col3:
-        selected_status = st.selectbox("Campaign Status", status_options, key="single_campaign_details_status")
+with objective_tabs[3]:
+    render_objective_agent_section(filtered_fact_main, "Conversion", "Conversion — CPR (EGP)", "🛒", "conv")
 
-    details_fact = filtered_fact_main.copy()
+with objective_tabs[4]:
+    render_overall_agent_section(filtered_fact_main)
 
-    if selected_agent != "🔵 Overall":
-        details_fact = details_fact[details_fact["media_buyer"].astype(str) == selected_agent]
-
-    if selected_objective != "All":
-        details_fact = details_fact[details_fact["objective_label"].astype(str) == selected_objective]
-
-    if selected_status != "All" and "campaign_status" in details_fact.columns:
-        details_fact = details_fact[details_fact["campaign_status"].astype(str) == selected_status]
-
-    campaign_df = build_campaign_summary(details_fact) if not details_fact.empty else pd.DataFrame()
-
-    if campaign_df.empty:
-        st.info("No campaigns found for the selected filters.")
-    else:
-        campaign_df = campaign_df.rename(columns={
-            "media_buyer": "Media Buyer",
-            "objective_label": "Objective",
-            "account_name": "Ad Account Name",
-            "campaign_name": "Campaign",
-            "campaign_status": "Campaign Status",
-            "spend": "Spent",
-            "results": "Results",
-            "cpl": "CPL",
-            "ctr": "CTR",
-            "cpc": "CPC",
-            "frequency": "Frequency",
-        })
-
-        cols = [
-            "Media Buyer",
-            "Objective",
-            "Ad Account Name",
-            "Campaign",
-            "Campaign Status",
-            "Spent",
-            "Results",
-            "CPL",
-            "CTR",
-            "CPC",
-            "Frequency",
-            "impressions",
-            "clicks",
-        ]
-        cols = [c for c in cols if c in campaign_df.columns]
-        st.dataframe(format_display_df(campaign_df[cols]), use_container_width=True, hide_index=True)
-
+st.divider()
+render_media_buyer_campaign_details(filtered_fact_main)
 st.divider()
 
 st.subheader("Audience Spend & Balance")
