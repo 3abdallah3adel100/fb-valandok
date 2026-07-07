@@ -1003,8 +1003,9 @@ def render_media_buyer_campaign_details(fact):
                 width: 100%;
                 max-height: 650px;
                 overflow: auto;
-                border: 1px solid rgba(250, 250, 250, 0.12);
+                border: 1px solid rgba(49, 51, 63, 0.20);
                 border-radius: 10px;
+                background: #ffffff;
             }
             .campaign-details-sticky-table table {
                 border-collapse: separate;
@@ -1012,12 +1013,15 @@ def render_media_buyer_campaign_details(fact):
                 width: max-content;
                 min-width: 1500px;
                 font-size: 14px;
+                background: #ffffff;
+                color: #31333f;
             }
             .campaign-details-sticky-table th,
             .campaign-details-sticky-table td {
                 padding: 8px 12px;
-                border-bottom: 1px solid rgba(250, 250, 250, 0.08);
-                background: #0e1117;
+                border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+                background: #ffffff;
+                color: #31333f;
                 white-space: nowrap;
                 text-align: left;
             }
@@ -1025,7 +1029,8 @@ def render_media_buyer_campaign_details(fact):
                 position: sticky;
                 top: 0;
                 z-index: 4;
-                background: #0e1117;
+                background: #f7f7f9;
+                color: #31333f;
                 font-weight: 600;
             }
             .campaign-details-sticky-table th:nth-child(1),
@@ -1035,7 +1040,7 @@ def render_media_buyer_campaign_details(fact):
                 z-index: 3;
                 min-width: 260px;
                 max-width: 260px;
-                box-shadow: 2px 0 0 rgba(250, 250, 250, 0.10);
+                box-shadow: 2px 0 0 rgba(49, 51, 63, 0.12);
             }
             .campaign-details-sticky-table th:nth-child(2),
             .campaign-details-sticky-table td:nth-child(2) {
@@ -1044,7 +1049,7 @@ def render_media_buyer_campaign_details(fact):
                 z-index: 3;
                 min-width: 190px;
                 max-width: 190px;
-                box-shadow: 2px 0 0 rgba(250, 250, 250, 0.10);
+                box-shadow: 2px 0 0 rgba(49, 51, 63, 0.12);
             }
             .campaign-details-sticky-table thead th:nth-child(1),
             .campaign-details-sticky-table thead th:nth-child(2) {
