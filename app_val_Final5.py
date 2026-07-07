@@ -996,73 +996,12 @@ def render_media_buyer_campaign_details(fact):
         cols = [c for c in cols if c in campaign_df.columns]
         display_df = format_display_df(campaign_df[cols])
 
-        st.markdown(
-            """
-            <style>
-            .campaign-details-sticky-table {
-                width: 100%;
-                max-height: 650px;
-                overflow: auto;
-                border: 1px solid rgba(49, 51, 63, 0.20);
-                border-radius: 10px;
-                background: #ffffff;
-            }
-            .campaign-details-sticky-table table {
-                border-collapse: separate;
-                border-spacing: 0;
-                width: max-content;
-                min-width: 1500px;
-                font-size: 14px;
-                background: #ffffff;
-                color: #31333f;
-            }
-            .campaign-details-sticky-table th,
-            .campaign-details-sticky-table td {
-                padding: 8px 12px;
-                border-bottom: 1px solid rgba(49, 51, 63, 0.12);
-                background: #ffffff;
-                color: #31333f;
-                white-space: nowrap;
-                text-align: left;
-            }
-            .campaign-details-sticky-table thead th {
-                position: sticky;
-                top: 0;
-                z-index: 4;
-                background: #f7f7f9;
-                color: #31333f;
-                font-weight: 600;
-            }
-            .campaign-details-sticky-table th:nth-child(1),
-            .campaign-details-sticky-table td:nth-child(1) {
-                position: sticky;
-                left: 0;
-                z-index: 3;
-                min-width: 260px;
-                max-width: 260px;
-                box-shadow: 2px 0 0 rgba(49, 51, 63, 0.12);
-            }
-            .campaign-details-sticky-table th:nth-child(2),
-            .campaign-details-sticky-table td:nth-child(2) {
-                position: sticky;
-                left: 284px;
-                z-index: 3;
-                min-width: 190px;
-                max-width: 190px;
-                box-shadow: 2px 0 0 rgba(49, 51, 63, 0.12);
-            }
-            .campaign-details-sticky-table thead th:nth-child(1),
-            .campaign-details-sticky-table thead th:nth-child(2) {
-                z-index: 5;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="campaign-details-sticky-table">{display_df.to_html(index=False, escape=True)}</div>',
-            unsafe_allow_html=True,
-        )
+        sticky_cols = [c for c in ["Ad Account Name", "Media Buyer"] if c in display_df.columns]
+        if sticky_cols:
+            display_df = display_df.set_index(sticky_cols)
+            st.dataframe(display_df, use_container_width=True)
+        else:
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 def render_overall_agent_section(fact):
     st.subheader("👥 Overall Agent")
