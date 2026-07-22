@@ -339,8 +339,13 @@ def fetch_graph_object(path_or_url, params=None):
     return data
 
 
-def fetch_all_pages(url, params=None, source_name=None, return_meta=False):
-    """Fetch every page and return rows plus pagination diagnostics."""
+def fetch_all_pages(url, params=None, source_name=None, return_meta=False, add_summary=False):
+    """Fetch every page and return rows plus pagination diagnostics.
+
+    add_summary must only be enabled for list edges such as adaccounts.
+    Meta Ads Insights does not accept the generic summary=true value used
+    by normal Graph list edges.
+    """
     all_rows = []
     visited_urls = set()
     pages = 0
@@ -348,7 +353,8 @@ def fetch_all_pages(url, params=None, source_name=None, return_meta=False):
     current_url = url
     current_params = dict(params or {})
     current_params.setdefault("limit", 100)
-    current_params.setdefault("summary", "true")
+    if add_summary:
+        current_params.setdefault("summary", "true")
 
     while True:
         if current_url in visited_urls:
@@ -442,6 +448,7 @@ def get_ad_accounts():
             {"limit": 100},
             "me/permissions",
             return_meta=True,
+            add_summary=True,
         )
         permissions = [
             row.get("permission")
@@ -458,6 +465,7 @@ def get_ad_accounts():
             {"fields": "id,name", "limit": 100},
             "me/businesses",
             return_meta=True,
+            add_summary=True,
         )
         discovered_businesses = business_rows
     except Exception as exc:
@@ -517,6 +525,7 @@ def get_ad_accounts():
                 },
                 source_name,
                 return_meta=True,
+                add_summary=True,
             )
             source_report.append({
                 "source": source_name,
@@ -659,7 +668,11 @@ def get_insights_for_account(account_id, since, until):
         "limit": 1000,
     }
 
-    rows = fetch_all_pages(url, params)
+    rows = fetch_all_pages(
+        url,
+        params,
+        source_name=f"act_{clean_id}/insights",
+    )
     df = pd.DataFrame(rows)
 
     if "actions" not in df.columns:
@@ -827,6 +840,11 @@ def fetch_one_account(row, since, until):
         balance_row = {}
     except Exception as e:
         error = f"{account_name}: {e}"
+        print(
+            f"[ACCOUNT_FETCH_ERROR] account_id={account_id} "
+            f"account_name={account_name} error={e}",
+            flush=True,
+        )
 
     return {
         "account_id": account_id,
@@ -1718,8 +1736,28 @@ if refresh_clicked:
             fact = prepare_data(all_campaigns_df, all_insights_df)
             fact = assign_fact_business_unit_from_accounts(fact, accounts_df)
 
+            print(
+                f"[REFRESH_SUMMARY] accounts={len(accounts_df)} "
+                f"campaign_frames={len(all_campaigns)} "
+                f"insight_frames={len(all_insights)} "
+                f"campaign_rows={len(all_campaigns_df)} "
+                f"insight_rows={len(all_insights_df)} "
+                f"errors={len(errors)}",
+                flush=True,
+            )
+
             if fact.empty:
-                st.error("Refresh finished but no data returned.")
+                st.error(
+                    "Refresh found the ad accounts, but Meta returned no campaign insights "
+                    "for the selected date range."
+                )
+                if errors:
+                    st.warning(f"Meta returned errors for {len(errors)} accounts.")
+                    st.code("\n".join(errors[:30]))
+                else:
+                    st.info(
+                        "No spend rows were returned. Try Today, Yesterday, or Last 7 Days."
+                    )
                 st.stop()
 
             gender_df = enrich_breakdown_spend(gender_df, accounts_df, "gender")
