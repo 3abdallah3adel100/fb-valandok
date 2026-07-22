@@ -35,7 +35,10 @@ if not check_password():
     st.stop()
 
 BASE_URL = "https://graph.facebook.com"
-API_VERSION = st.secrets.get("META_API_VERSION", "v17.0")
+API_VERSION = str(st.secrets.get("META_API_VERSION", "")).strip()
+if not re.fullmatch(r"v\d+\.\d+", API_VERSION):
+    st.error("Set META_API_VERSION in Streamlit secrets to a currently supported Meta Marketing API version, for example vXX.0.")
+    st.stop()
 ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
 BUSINESS_IDS = ["751488620224306", "1178859133269743"]
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
@@ -295,30 +298,65 @@ def load_snapshot():
 # -----------------------------
 # API
 # -----------------------------
-@st.cache_data(ttl=1800)
+def _graph_error_message(response):
+    """Return a useful Meta Graph API error instead of hiding it."""
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    message = error.get("message") or response.text[:500] or "Unknown Meta API error"
+    code = error.get("code")
+    subcode = error.get("error_subcode")
+    error_type = error.get("type")
+
+    details = [f"HTTP {response.status_code}"]
+    if error_type:
+        details.append(str(error_type))
+    if code is not None:
+        details.append(f"code={code}")
+    if subcode is not None:
+        details.append(f"subcode={subcode}")
+
+    return f"{' | '.join(details)} | {message}"
+
+
 def fetch_all_pages(url, params=None):
+    """Fetch every page. Do not cache network pagination during a manual refresh."""
     all_rows = []
+    visited_urls = set()
 
     while True:
+        if url in visited_urls:
+            raise RuntimeError(f"Pagination loop detected for: {url}")
+        visited_urls.add(url)
+
         response = requests.get(url, params=params, timeout=90)
-        response.raise_for_status()
+        if not response.ok:
+            raise RuntimeError(_graph_error_message(response))
+
         data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected response from Meta for {url}")
 
         all_rows.extend(data.get("data", []))
 
-        paging = data.get("paging", {})
+        paging = data.get("paging", {}) or {}
         next_url = paging.get("next")
         if not next_url:
             break
 
         url = next_url
-        params = None
+        params = None  # next_url already includes cursor and query parameters
 
     return all_rows
 
-@st.cache_data(ttl=1800)
+
 def get_ad_accounts():
+    """Load every visible account from /me plus both configured businesses."""
     all_dfs = []
+    source_report = []
 
     sources = [
         ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
@@ -337,33 +375,40 @@ def get_ad_accounts():
                 "limit": 500,
             }
             rows = fetch_all_pages(url, params)
+            source_report.append({"source": source_name, "count": len(rows), "error": None})
+
             df = pd.DataFrame(rows)
             if not df.empty:
                 df["source"] = source_name
                 all_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never silently ignore a failed Business endpoint.
+            source_report.append({"source": source_name, "count": 0, "error": str(exc)})
+
+    st.session_state["ad_account_source_report"] = source_report
 
     if not all_dfs:
-        return pd.DataFrame(), pd.DataFrame()
+        errors = "\n".join(
+            f"- {item['source']}: {item['error']}"
+            for item in source_report
+            if item.get("error")
+        )
+        raise RuntimeError(f"No ad accounts returned from any source.\n{errors}")
 
     raw_accounts = pd.concat(all_dfs, ignore_index=True)
 
-    # Speed optimization with safe Unknown handling:
-    # - Fetch all El-Okaby business accounts, even if naming is not coded correctly.
-    #   These will appear under Media Buyer = Unknown.
-    # - Fetch VAL accounts only when they match VAL Hair / VAL Booty naming.
-    # - Keep matching accounts from /me/adaccounts as well.
-    if "name" in raw_accounts.columns:
-        name_match = raw_accounts["name"].apply(is_relevant_account_name)
-        okaby_source = raw_accounts["source"].apply(source_is_okaby) if "source" in raw_accounts.columns else False
-        raw_accounts = raw_accounts[name_match | okaby_source].copy()
-
+    # IMPORTANT: Do not filter accounts by naming convention here.
+    # Filtering here was dropping valid VAL/client accounts before their data was fetched.
+    # Keep every account returned by Meta; classify names later in the dashboard.
     dedup = raw_accounts.copy()
+    dedup_sort_cols = [c for c in ["name", "source"] if c in dedup.columns]
+    if dedup_sort_cols:
+        dedup = dedup.sort_values(dedup_sort_cols)
+
     if "id" in dedup.columns:
-        dedup = dedup.sort_values(["name", "source"]).drop_duplicates(subset=["id"], keep="first")
+        dedup = dedup.drop_duplicates(subset=["id"], keep="first")
     elif "account_id" in dedup.columns:
-        dedup = dedup.sort_values(["name", "source"]).drop_duplicates(subset=["account_id"], keep="first")
+        dedup = dedup.drop_duplicates(subset=["account_id"], keep="first")
 
     return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True)
 
@@ -1358,7 +1403,14 @@ if refresh_clicked:
 
         with st.status("Refreshing data in background-like flow...", expanded=True) as status:
             accounts_df, raw_accounts_df = get_ad_accounts()
-            status.write(f"Loaded {len(accounts_df)} relevant ad accounts from configured businesses.")
+            status.write(f"Loaded {len(accounts_df)} unique ad accounts from configured sources.")
+
+            source_report = st.session_state.get("ad_account_source_report", [])
+            for item in source_report:
+                if item.get("error"):
+                    status.write(f"❌ {item['source']}: {item['error']}")
+                else:
+                    status.write(f"✅ {item['source']}: {item['count']} accounts")
 
             if accounts_df.empty:
                 st.error("No matching Okaby / VAL ad accounts found.")
@@ -1511,7 +1563,7 @@ with right_filter_col:
     selected_business_unit = st.selectbox(
         "Business Unit",
         ["El - Okaby", "Val Hair", "VAL Booty", "All"],
-        index=0,
+        index=3,
         key="business_unit_selector",
     )
 
