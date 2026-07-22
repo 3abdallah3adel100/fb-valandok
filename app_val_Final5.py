@@ -322,69 +322,273 @@ def _graph_error_message(response):
     return f"{' | '.join(details)} | {message}"
 
 
-def fetch_all_pages(url, params=None):
-    """Fetch every page. Do not cache network pagination during a manual refresh."""
+
+def _graph_headers():
+    return {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+
+
+def fetch_graph_object(path_or_url, params=None):
+    """Fetch one Graph object and expose the exact Meta error."""
+    url = path_or_url if str(path_or_url).startswith("http") else f"{BASE_URL}/{API_VERSION}/{str(path_or_url).lstrip('/')}"
+    response = requests.get(url, params=params or {}, headers=_graph_headers(), timeout=90)
+    if not response.ok:
+        raise RuntimeError(_graph_error_message(response))
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected response from Meta for {url}")
+    return data
+
+
+def fetch_all_pages(url, params=None, source_name=None, return_meta=False):
+    """Fetch every page and return rows plus pagination diagnostics."""
     all_rows = []
     visited_urls = set()
+    pages = 0
+    summary_total_count = None
+    current_url = url
+    current_params = dict(params or {})
+    current_params.setdefault("limit", 100)
+    current_params.setdefault("summary", "true")
 
     while True:
-        if url in visited_urls:
-            raise RuntimeError(f"Pagination loop detected for: {url}")
-        visited_urls.add(url)
+        if current_url in visited_urls:
+            raise RuntimeError(f"Pagination loop detected for: {current_url}")
+        visited_urls.add(current_url)
 
-        response = requests.get(url, params=params, timeout=90)
+        response = requests.get(
+            current_url,
+            params=current_params,
+            headers=_graph_headers(),
+            timeout=90,
+        )
         if not response.ok:
             raise RuntimeError(_graph_error_message(response))
 
         data = response.json()
         if not isinstance(data, dict):
-            raise RuntimeError(f"Unexpected response from Meta for {url}")
+            raise RuntimeError(f"Unexpected response from Meta for {current_url}")
 
-        all_rows.extend(data.get("data", []))
+        pages += 1
+        page_rows = data.get("data", [])
+        if isinstance(page_rows, list):
+            all_rows.extend(page_rows)
+
+        summary = data.get("summary") or {}
+        if summary_total_count is None and isinstance(summary, dict):
+            summary_total_count = summary.get("total_count")
 
         paging = data.get("paging", {}) or {}
         next_url = paging.get("next")
         if not next_url:
             break
 
-        url = next_url
-        params = None  # next_url already includes cursor and query parameters
+        current_url = next_url
+        current_params = None  # next URL already contains the cursor
 
-    return all_rows
+    label = source_name or url
+    print(
+        f"[ACCOUNT_DISCOVERY] OK source={label} rows={len(all_rows)} "
+        f"pages={pages} total_count={summary_total_count}",
+        flush=True,
+    )
+    meta = {
+        "count": len(all_rows),
+        "pages": pages,
+        "total_count": summary_total_count,
+    }
+    return (all_rows, meta) if return_meta else all_rows
+
+
+def _secret_id_list(name):
+    raw = st.secrets.get(name, "")
+    if isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        values = re.split(r"[\s,;]+", str(raw))
+    return [str(v).strip().replace("act_", "") for v in values if str(v).strip()]
 
 
 def get_ad_accounts():
-    """Load every visible account from /me plus both configured businesses."""
+    """
+    Discover accounts from every route available to the token:
+    1) /me/adaccounts
+    2) system-user assigned_ad_accounts
+    3) configured businesses
+    4) businesses dynamically visible through /me/businesses
+    5) optional explicit account IDs from Streamlit secrets
+    """
     all_dfs = []
     source_report = []
+    discovery_errors = []
+
+    identity = {}
+    permissions = []
+    discovered_businesses = []
+
+    try:
+        identity = fetch_graph_object("me", {"fields": "id,name"})
+        print(
+            f"[ACCOUNT_DISCOVERY] token_identity id={identity.get('id')} "
+            f"name={identity.get('name')}",
+            flush=True,
+        )
+    except Exception as exc:
+        discovery_errors.append(f"me: {exc}")
+        print(f"[ACCOUNT_DISCOVERY] ERROR source=me error={exc}", flush=True)
+
+    try:
+        permission_rows, permission_meta = fetch_all_pages(
+            f"{BASE_URL}/{API_VERSION}/me/permissions",
+            {"limit": 100},
+            "me/permissions",
+            return_meta=True,
+        )
+        permissions = [
+            row.get("permission")
+            for row in permission_rows
+            if row.get("status") == "granted" and row.get("permission")
+        ]
+    except Exception as exc:
+        discovery_errors.append(f"me/permissions: {exc}")
+        print(f"[ACCOUNT_DISCOVERY] ERROR source=me/permissions error={exc}", flush=True)
+
+    try:
+        business_rows, business_meta = fetch_all_pages(
+            f"{BASE_URL}/{API_VERSION}/me/businesses",
+            {"fields": "id,name", "limit": 100},
+            "me/businesses",
+            return_meta=True,
+        )
+        discovered_businesses = business_rows
+    except Exception as exc:
+        discovery_errors.append(f"me/businesses: {exc}")
+        print(f"[ACCOUNT_DISCOVERY] ERROR source=me/businesses error={exc}", flush=True)
+
+    configured_business_ids = [str(x).strip() for x in BUSINESS_IDS if str(x).strip()]
+    configured_business_ids.extend(_secret_id_list("EXTRA_BUSINESS_IDS"))
+    discovered_business_ids = [
+        str(row.get("id")).strip()
+        for row in discovered_businesses
+        if row.get("id")
+    ]
+    resolved_business_ids = list(dict.fromkeys(configured_business_ids + discovered_business_ids))
 
     sources = [
         ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
     ]
-    for business_id in BUSINESS_IDS:
+
+    identity_id = str(identity.get("id", "")).strip()
+    if identity_id:
+        # This is the important route when META_ACCESS_TOKEN belongs to a System User.
+        sources.append((
+            f"system_user/{identity_id}/assigned_ad_accounts",
+            f"{BASE_URL}/{API_VERSION}/{identity_id}/assigned_ad_accounts",
+        ))
+
+    for business_id in resolved_business_ids:
         sources.extend([
-            (f"business/{business_id}/owned_ad_accounts", f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts"),
-            (f"business/{business_id}/client_ad_accounts", f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts"),
+            (
+                f"business/{business_id}/owned_ad_accounts",
+                f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts",
+            ),
+            (
+                f"business/{business_id}/client_ad_accounts",
+                f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts",
+            ),
         ])
 
+    # Remove duplicate URLs while preserving order.
+    unique_sources = []
+    seen_urls = set()
     for source_name, url in sources:
+        if url not in seen_urls:
+            unique_sources.append((source_name, url))
+            seen_urls.add(url)
+
+    discovery_fields = "id,account_id,name,account_status,currency"
+
+    for source_name, url in unique_sources:
         try:
-            params = {
-                "fields": "id,account_id,name,account_status,currency,funding_source_details",
-                "access_token": ACCESS_TOKEN,
-                "limit": 500,
-            }
-            rows = fetch_all_pages(url, params)
-            source_report.append({"source": source_name, "count": len(rows), "error": None})
+            rows, page_meta = fetch_all_pages(
+                url,
+                {
+                    "fields": discovery_fields,
+                    "limit": 100,
+                },
+                source_name,
+                return_meta=True,
+            )
+            source_report.append({
+                "source": source_name,
+                "count": page_meta["count"],
+                "pages": page_meta["pages"],
+                "total_count": page_meta["total_count"],
+                "error": None,
+            })
 
             df = pd.DataFrame(rows)
             if not df.empty:
                 df["source"] = source_name
                 all_dfs.append(df)
         except Exception as exc:
-            # Never silently ignore a failed Business endpoint.
-            source_report.append({"source": source_name, "count": 0, "error": str(exc)})
+            error_text = str(exc)
+            source_report.append({
+                "source": source_name,
+                "count": 0,
+                "pages": 0,
+                "total_count": None,
+                "error": error_text,
+            })
+            print(
+                f"[ACCOUNT_DISCOVERY] ERROR source={source_name} error={error_text}",
+                flush=True,
+            )
 
+    # Optional fallback for known accounts that Meta does not expose through list edges.
+    # Example Streamlit secret:
+    # EXTRA_AD_ACCOUNT_IDS = "123456789,987654321"
+    explicit_rows = []
+    for clean_id in _secret_id_list("EXTRA_AD_ACCOUNT_IDS"):
+        source_name = f"explicit/act_{clean_id}"
+        try:
+            row = fetch_graph_object(
+                f"act_{clean_id}",
+                {"fields": discovery_fields},
+            )
+            explicit_rows.append(row)
+            source_report.append({
+                "source": source_name,
+                "count": 1,
+                "pages": 1,
+                "total_count": 1,
+                "error": None,
+            })
+            print(f"[ACCOUNT_DISCOVERY] OK source={source_name} rows=1", flush=True)
+        except Exception as exc:
+            source_report.append({
+                "source": source_name,
+                "count": 0,
+                "pages": 0,
+                "total_count": None,
+                "error": str(exc),
+            })
+            print(f"[ACCOUNT_DISCOVERY] ERROR source={source_name} error={exc}", flush=True)
+
+    if explicit_rows:
+        explicit_df = pd.DataFrame(explicit_rows)
+        explicit_df["source"] = "explicit_ad_account_ids"
+        all_dfs.append(explicit_df)
+
+    discovery = {
+        "identity": identity,
+        "permissions": permissions,
+        "configured_business_ids": configured_business_ids,
+        "discovered_businesses": discovered_businesses,
+        "resolved_business_ids": resolved_business_ids,
+        "sources": source_report,
+        "discovery_errors": discovery_errors,
+    }
+    st.session_state["ad_account_discovery"] = discovery
     st.session_state["ad_account_source_report"] = source_report
 
     if not all_dfs:
@@ -393,13 +597,10 @@ def get_ad_accounts():
             for item in source_report
             if item.get("error")
         )
-        raise RuntimeError(f"No ad accounts returned from any source.\n{errors}")
+        raise RuntimeError(f"No ad accounts returned from any discovery route.\n{errors}")
 
-    raw_accounts = pd.concat(all_dfs, ignore_index=True)
+    raw_accounts = pd.concat(all_dfs, ignore_index=True, sort=False)
 
-    # IMPORTANT: Do not filter accounts by naming convention here.
-    # Filtering here was dropping valid VAL/client accounts before their data was fetched.
-    # Keep every account returned by Meta; classify names later in the dashboard.
     dedup = raw_accounts.copy()
     dedup_sort_cols = [c for c in ["name", "source"] if c in dedup.columns]
     if dedup_sort_cols:
@@ -410,6 +611,11 @@ def get_ad_accounts():
     elif "account_id" in dedup.columns:
         dedup = dedup.drop_duplicates(subset=["account_id"], keep="first")
 
+    print(
+        f"[ACCOUNT_DISCOVERY] UNIQUE_ACCOUNTS={len(dedup)} "
+        f"RAW_ROWS={len(raw_accounts)} BUSINESSES={len(resolved_business_ids)}",
+        flush=True,
+    )
     return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True)
 
 @st.cache_data(ttl=1800)
@@ -1381,12 +1587,36 @@ with st.sidebar:
 
     max_workers = st.slider("Parallel workers", min_value=2, max_value=10, value=4, step=2)
     show_account_sources = st.checkbox("Show account sources", value=True)
+    discovery_test_clicked = st.button("Test Account Discovery", use_container_width=True)
     refresh_clicked = st.button("Refresh Data", use_container_width=True)
     force_unlock_clicked = st.button("Clear stuck refresh lock", use_container_width=True)
 
 if force_unlock_clicked:
     force_clear_refresh_lock()
     st.success("Refresh lock cleared. You can click Refresh Data now.")
+
+if discovery_test_clicked:
+    try:
+        test_accounts_df, test_raw_accounts_df = get_ad_accounts()
+        st.success(f"Discovery found {len(test_accounts_df)} unique ad accounts.")
+        discovery = st.session_state.get("ad_account_discovery", {}) or {}
+        identity = discovery.get("identity", {}) or {}
+        st.write({
+            "token_object_id": identity.get("id"),
+            "token_object_name": identity.get("name"),
+            "granted_permissions": discovery.get("permissions", []),
+            "resolved_business_ids": discovery.get("resolved_business_ids", []),
+        })
+        source_rows = discovery.get("sources", [])
+        if source_rows:
+            st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
+        if not test_accounts_df.empty:
+            visible_cols = [c for c in ["id", "account_id", "name", "account_status", "currency", "source"] if c in test_accounts_df.columns]
+            st.dataframe(test_accounts_df[visible_cols], use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.error(f"Account discovery failed: {exc}")
+        raise
+    st.stop()
 
 if refresh_clicked:
     if not acquire_refresh_lock():
@@ -1403,14 +1633,14 @@ if refresh_clicked:
 
         with st.status("Refreshing data in background-like flow...", expanded=True) as status:
             accounts_df, raw_accounts_df = get_ad_accounts()
-            status.write(f"Loaded {len(accounts_df)} unique ad accounts from configured sources.")
+            status.write(f"Loaded {len(accounts_df)} unique ad accounts from all discovery routes.")
 
             source_report = st.session_state.get("ad_account_source_report", [])
             for item in source_report:
                 if item.get("error"):
                     status.write(f"❌ {item['source']}: {item['error']}")
                 else:
-                    status.write(f"✅ {item['source']}: {item['count']} accounts")
+                    status.write(f"✅ {item['source']}: {item['count']} accounts | pages={item.get('pages', 0)} | API total={item.get('total_count')}")
 
             if accounts_df.empty:
                 st.error("No matching Okaby / VAL ad accounts found.")
@@ -1507,15 +1737,17 @@ if refresh_clicked:
                 if "balance" in balance_df.columns:
                     balance_df["balance"] = pd.to_numeric(balance_df["balance"], errors="coerce")
 
+            discovery = st.session_state.get("ad_account_discovery", {})
             meta = {
                 "last_fetch_ts": pd.Timestamp.utcnow().isoformat(),
                 "date_from": str(since),
                 "date_to": str(until),
                 "accounts_count": int(accounts_df["id"].nunique()),
-                "business_ids": BUSINESS_IDS,
+                "business_ids": discovery.get("resolved_business_ids", BUSINESS_IDS),
                 "rows_count": int(len(fact)),
                 "errors_count": int(len(errors)),
                 "errors": errors[:100],
+                "account_discovery": discovery,
             }
 
             save_snapshot_atomic(
@@ -1556,6 +1788,25 @@ st.caption(
     f" | Fetched accounts: {meta.get('accounts_count', 0)}"
     f" | Errors: {meta.get('errors_count', 0)}"
 )
+
+discovery_meta = meta.get("account_discovery", {}) or {}
+if discovery_meta:
+    with st.expander("🔎 Account Discovery Diagnostics", expanded=True):
+        identity = discovery_meta.get("identity", {}) or {}
+        st.write({
+            "token_object_id": identity.get("id"),
+            "token_object_name": identity.get("name"),
+            "granted_permissions": discovery_meta.get("permissions", []),
+            "configured_business_ids": discovery_meta.get("configured_business_ids", []),
+            "discovered_businesses": discovery_meta.get("discovered_businesses", []),
+            "resolved_business_ids": discovery_meta.get("resolved_business_ids", []),
+        })
+        source_rows = discovery_meta.get("sources", [])
+        if source_rows:
+            st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
+        discovery_errors = discovery_meta.get("discovery_errors", [])
+        if discovery_errors:
+            st.warning("\n".join(discovery_errors))
 
 # Main business unit selector on the right
 left_title_col, right_filter_col = st.columns([3, 1])
