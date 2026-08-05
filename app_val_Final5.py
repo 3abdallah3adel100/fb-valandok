@@ -241,6 +241,66 @@ def get_config_value(name, default=""):
     return str(value).strip()
 
 
+def get_raw_config_value(name, default=None):
+    """Read a raw secret value without converting TOML arrays to strings."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    if value in [None, ""]:
+        value = os.getenv(name)
+    if value in [None, ""]:
+        return default
+    return value
+
+
+def normalize_whatsapp_recipient(value):
+    """Return a WhatsApp recipient in digits-only international format."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits
+
+
+def get_whatsapp_report_recipients():
+    """
+    Read one or many report recipients.
+
+    Preferred TOML format:
+        WHATSAPP_REPORT_TO = ["201...", "201..."]
+
+    Also supported for backward compatibility:
+        WHATSAPP_REPORT_TO = "201...,201..."
+        WHATSAPP_REPORT_TO_NUMBERS = ["201...", "201..."]
+    """
+    raw = get_raw_config_value("WHATSAPP_REPORT_TO_NUMBERS")
+    if raw in [None, ""]:
+        raw = get_raw_config_value("WHATSAPP_REPORT_TO")
+
+    if raw in [None, ""]:
+        return []
+
+    if isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = re.split(r"[,;\n]+", str(raw))
+
+    recipients = []
+    seen = set()
+    for item in items:
+        recipient = normalize_whatsapp_recipient(item)
+        if not recipient or recipient in seen:
+            continue
+        seen.add(recipient)
+        recipients.append(recipient)
+    return recipients
+
+
+def mask_whatsapp_recipient(recipient):
+    digits = normalize_whatsapp_recipient(recipient)
+    if len(digits) <= 4:
+        return digits or "Unknown"
+    return f"{'*' * max(0, len(digits) - 4)}{digits[-4:]}"
+
+
 def atomic_write_json(file_path, payload):
     temp_path = file_path.with_name(f"{file_path.name}.{uuid.uuid4().hex}.tmp")
     with open(temp_path, "w", encoding="utf-8") as f:
@@ -571,48 +631,126 @@ def send_whatsapp_message_chunk(phone_number_id, access_token, recipient, api_ve
 def whatsapp_report_worker(job, config):
     job_id = job.get("job_id")
     chunks = job.get("chunks") or []
-    message_ids = []
+    recipients = config.get("recipients") or []
+    all_message_ids = []
+    recipient_results = []
+    sent_messages = 0
+    completed_recipients = 0
+    failed_recipients = 0
+    total_messages = len(chunks) * len(recipients)
 
     try:
         write_whatsapp_report_status_for_job(
             job_id,
             "sending",
             started_at=utc_now_iso(),
-            total_messages=len(chunks),
+            total_recipients=len(recipients),
+            completed_recipients=0,
+            failed_recipients=0,
+            total_messages=total_messages,
             sent_messages=0,
             error=None,
+            recipient_results=[],
         )
 
-        for index, chunk in enumerate(chunks, start=1):
+        for recipient_index, recipient in enumerate(recipients, start=1):
+            masked_recipient = mask_whatsapp_recipient(recipient)
+            recipient_message_ids = []
+            recipient_sent_messages = 0
+
+            try:
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    write_whatsapp_report_status_for_job(
+                        job_id,
+                        "sending",
+                        current_recipient=recipient_index,
+                        current_recipient_masked=masked_recipient,
+                        current_message=chunk_index,
+                        total_recipients=len(recipients),
+                        completed_recipients=completed_recipients,
+                        failed_recipients=failed_recipients,
+                        total_messages=total_messages,
+                        sent_messages=sent_messages,
+                        recipient_results=recipient_results,
+                    )
+
+                    result = send_whatsapp_message_chunk(
+                        phone_number_id=config["phone_number_id"],
+                        access_token=config["access_token"],
+                        recipient=recipient,
+                        api_version=config["api_version"],
+                        body=chunk,
+                    )
+                    recipient_sent_messages += 1
+                    sent_messages += 1
+
+                    for item in result.get("messages", []):
+                        message_id = item.get("id")
+                        if message_id:
+                            recipient_message_ids.append(message_id)
+                            all_message_ids.append(message_id)
+
+                completed_recipients += 1
+                recipient_results.append({
+                    "recipient": masked_recipient,
+                    "state": "completed",
+                    "sent_messages": recipient_sent_messages,
+                    "message_ids": recipient_message_ids,
+                    "error": None,
+                })
+
+            except Exception as recipient_error:
+                failed_recipients += 1
+                safe_error = str(recipient_error)
+                access_token = config.get("access_token", "")
+                if access_token:
+                    safe_error = safe_error.replace(access_token, "[REDACTED]")
+                recipient_results.append({
+                    "recipient": masked_recipient,
+                    "state": "error",
+                    "sent_messages": recipient_sent_messages,
+                    "message_ids": recipient_message_ids,
+                    "error": safe_error[:1500],
+                })
+
             write_whatsapp_report_status_for_job(
                 job_id,
                 "sending",
-                current_message=index,
-                total_messages=len(chunks),
-                sent_messages=index - 1,
+                current_recipient=recipient_index,
+                current_recipient_masked=masked_recipient,
+                total_recipients=len(recipients),
+                completed_recipients=completed_recipients,
+                failed_recipients=failed_recipients,
+                total_messages=total_messages,
+                sent_messages=sent_messages,
+                recipient_results=recipient_results,
             )
-            result = send_whatsapp_message_chunk(
-                phone_number_id=config["phone_number_id"],
-                access_token=config["access_token"],
-                recipient=config["recipient"],
-                api_version=config["api_version"],
-                body=chunk,
-            )
-            for item in result.get("messages", []):
-                message_id = item.get("id")
-                if message_id:
-                    message_ids.append(message_id)
+
+        if failed_recipients == 0:
+            final_state = "completed"
+            final_error = None
+        elif completed_recipients > 0:
+            final_state = "partial"
+            final_error = f"Failed for {failed_recipients} of {len(recipients)} recipients."
+        else:
+            final_state = "error"
+            final_error = f"WhatsApp report failed for all {len(recipients)} recipients."
 
         write_whatsapp_report_status_for_job(
             job_id,
-            "completed",
+            final_state,
             completed_at=utc_now_iso(),
-            total_messages=len(chunks),
-            sent_messages=len(chunks),
+            total_recipients=len(recipients),
+            completed_recipients=completed_recipients,
+            failed_recipients=failed_recipients,
+            total_messages=total_messages,
+            sent_messages=sent_messages,
             current_message=len(chunks),
-            message_ids=message_ids,
-            error=None,
+            message_ids=all_message_ids,
+            recipient_results=recipient_results,
+            error=final_error,
         )
+
     except Exception as e:
         safe_error = str(e)
         access_token = config.get("access_token", "")
@@ -623,7 +761,8 @@ def whatsapp_report_worker(job, config):
             "error",
             failed_at=utc_now_iso(),
             error=safe_error[:3000],
-            message_ids=message_ids,
+            message_ids=all_message_ids,
+            recipient_results=recipient_results,
         )
     finally:
         release_whatsapp_send_lock()
@@ -659,10 +798,11 @@ def start_pending_whatsapp_report():
     if not acquire_whatsapp_send_lock(job_id):
         return
 
+    recipients = get_whatsapp_report_recipients()
     config = {
         "access_token": get_config_value("WHATSAPP_ACCESS_TOKEN"),
         "phone_number_id": get_config_value("WHATSAPP_PHONE_NUMBER_ID"),
-        "recipient": get_config_value("WHATSAPP_REPORT_TO"),
+        "recipients": recipients,
         "api_version": get_config_value("WHATSAPP_API_VERSION", API_VERSION),
     }
 
@@ -671,7 +811,7 @@ def start_pending_whatsapp_report():
         for name, value in {
             "WHATSAPP_ACCESS_TOKEN": config["access_token"],
             "WHATSAPP_PHONE_NUMBER_ID": config["phone_number_id"],
-            "WHATSAPP_REPORT_TO": config["recipient"],
+            "WHATSAPP_REPORT_TO": config["recipients"],
         }.items()
         if not value
     ]
@@ -680,10 +820,24 @@ def start_pending_whatsapp_report():
             "error",
             job_id=job_id,
             failed_at=utc_now_iso(),
-            error=f"Missing Streamlit secret(s): {', '.join(missing)}",
+            error=(
+                f"Missing Streamlit secret(s): {', '.join(missing)}. "
+                "WHATSAPP_REPORT_TO can be one number or a TOML list of numbers."
+            ),
         )
         release_whatsapp_send_lock()
         return
+
+    chunks = job.get("chunks") or []
+    write_whatsapp_report_status_for_job(
+        job_id,
+        "queued",
+        total_recipients=len(recipients),
+        completed_recipients=0,
+        failed_recipients=0,
+        total_messages=len(chunks) * len(recipients),
+        sent_messages=0,
+    )
 
     thread = threading.Thread(
         target=whatsapp_report_worker,
@@ -706,20 +860,48 @@ def _render_whatsapp_report_status_panel():
     state = status.get("state", "unknown")
     sent = int(status.get("sent_messages", 0) or 0)
     total = int(status.get("total_messages", 0) or 0)
+    total_recipients = int(status.get("total_recipients", 0) or 0)
+    completed_recipients = int(status.get("completed_recipients", 0) or 0)
+    failed_recipients = int(status.get("failed_recipients", 0) or 0)
     range_label = status.get("range_label", "-")
 
     if state == "queued":
-        st.info(f"Queued after refresh — {range_label}")
+        recipient_text = f" | Recipients: {total_recipients}" if total_recipients else ""
+        st.info(f"Queued after refresh — {range_label}{recipient_text}")
     elif state == "sending":
-        st.warning(f"Sending WhatsApp report: {sent}/{total}")
+        st.warning(
+            f"Sending WhatsApp report: {sent}/{total} messages | "
+            f"Recipients finished: {completed_recipients + failed_recipients}/{total_recipients}"
+        )
+        if status.get("current_recipient_masked"):
+            st.caption(f"Current recipient: {status.get('current_recipient_masked')}")
     elif state == "completed":
-        st.success(f"WhatsApp report sent successfully: {sent}/{total}")
+        st.success(
+            f"WhatsApp report sent to all recipients: "
+            f"{completed_recipients}/{total_recipients} | Messages: {sent}/{total}"
+        )
+    elif state == "partial":
+        st.warning(
+            f"Report sent to {completed_recipients}/{total_recipients} recipients. "
+            f"Failed recipients: {failed_recipients}. Dashboard data was not affected."
+        )
     elif state == "error":
         st.error("WhatsApp report failed. Dashboard data was not affected.")
         if status.get("error"):
             st.code(str(status.get("error")), language=None)
     else:
         st.caption(f"Status: {state}")
+
+    failed_results = [
+        item for item in (status.get("recipient_results") or [])
+        if item.get("state") == "error"
+    ]
+    if failed_results:
+        with st.expander("Recipient errors", expanded=(state in {"partial", "error"})):
+            for item in failed_results:
+                st.error(f"Recipient {item.get('recipient', 'Unknown')} failed")
+                if item.get("error"):
+                    st.code(str(item.get("error")), language=None)
 
     if status.get("updated_at"):
         st.caption(f"Status updated: {status.get('updated_at')}")
