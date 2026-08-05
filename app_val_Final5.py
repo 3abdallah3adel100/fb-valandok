@@ -2,6 +2,8 @@ import re
 import os
 import json
 import time
+import threading
+import uuid
 import requests
 import pandas as pd
 import plotly.express as px
@@ -52,6 +54,11 @@ GENDER_FILE = DATA_DIR / "gender_snapshot.parquet"
 AGE_FILE = DATA_DIR / "age_snapshot.parquet"
 BALANCE_FILE = DATA_DIR / "balance_snapshot.parquet"
 LOCK_FILE = DATA_DIR / "refresh.lock"
+
+WHATSAPP_REPORT_JOB_FILE = DATA_DIR / "whatsapp_report_job.json"
+WHATSAPP_REPORT_STATUS_FILE = DATA_DIR / "whatsapp_report_status.json"
+WHATSAPP_REPORT_SEND_LOCK_FILE = DATA_DIR / "whatsapp_report_send.lock"
+WHATSAPP_REPORT_SEND_LOCK_MAX_AGE_SECONDS = 15 * 60
 
 TMP_FACT_FILE = DATA_DIR / "fact_snapshot.tmp.parquet"
 TMP_ACCOUNTS_FILE = DATA_DIR / "accounts_snapshot.tmp.parquet"
@@ -217,6 +224,481 @@ def format_display_df(df):
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).round(0)
 
     return out
+
+# -----------------------------
+# WhatsApp refresh report
+# -----------------------------
+def get_config_value(name, default=""):
+    """Read configuration from Streamlit secrets, with env-var fallback."""
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    if value in [None, ""]:
+        value = os.getenv(name, default)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def atomic_write_json(file_path, payload):
+    temp_path = file_path.with_name(f"{file_path.name}.{uuid.uuid4().hex}.tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, file_path)
+
+
+def read_json_file(file_path, default=None):
+    try:
+        if file_path.exists():
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {} if default is None else default
+
+
+def utc_now_iso():
+    return pd.Timestamp.utcnow().isoformat()
+
+
+def write_whatsapp_report_status(state, **extra):
+    current = read_json_file(WHATSAPP_REPORT_STATUS_FILE, {})
+    payload = {
+        **current,
+        "state": state,
+        "updated_at": utc_now_iso(),
+        **extra,
+    }
+    atomic_write_json(WHATSAPP_REPORT_STATUS_FILE, payload)
+    return payload
+
+
+def read_whatsapp_report_status():
+    return read_json_file(WHATSAPP_REPORT_STATUS_FILE, {})
+
+
+def write_whatsapp_report_status_for_job(job_id, state, **extra):
+    """Avoid an older sender thread overwriting the status of a newer refresh."""
+    current = read_whatsapp_report_status()
+    current_job_id = current.get("job_id")
+    if current_job_id and current_job_id != job_id:
+        return current
+    return write_whatsapp_report_status(state, job_id=job_id, **extra)
+
+
+def format_report_money(value):
+    return f"{to_float(value):,.2f} EGP"
+
+
+def format_report_results(value):
+    return f"{to_float(value):,.0f}"
+
+
+def make_refresh_range_label(quick_range, since, until):
+    if quick_range and quick_range != "Custom":
+        return str(quick_range)
+    return f"Custom ({since} → {until})"
+
+
+def build_whatsapp_refresh_report(fact, gender_df, range_label, since, until):
+    overall = build_overall_summary(fact)
+    buyer_summary = build_buyer_summary(fact) if not fact.empty else pd.DataFrame()
+
+    valid_agents = buyer_summary.copy()
+    if not valid_agents.empty:
+        valid_agents["spend"] = pd.to_numeric(valid_agents["spend"], errors="coerce").fillna(0)
+        valid_agents["results"] = pd.to_numeric(valid_agents["results"], errors="coerce").fillna(0)
+        valid_agents["cpl"] = pd.to_numeric(valid_agents["cpl"], errors="coerce")
+        valid_agents = valid_agents[
+            (valid_agents["spend"] > 0)
+            & (valid_agents["results"] > 0)
+            & valid_agents["cpl"].notna()
+            & (valid_agents["media_buyer"].astype(str).str.strip() != "Unknown")
+        ].copy()
+
+    highest = None
+    lowest = None
+    if not valid_agents.empty:
+        highest = valid_agents.loc[valid_agents["cpl"].idxmax()].to_dict()
+        lowest = valid_agents.loc[valid_agents["cpl"].idxmin()].to_dict()
+
+    lines = [
+        "📊 Meta Ads Refresh Report",
+        f"Range: {range_label}",
+        f"Dates: {since} → {until}",
+        "",
+        f"Overall Spend: {format_report_money(overall['total_spend'])}",
+        f"Overall Leads: {format_report_results(overall['total_results'])}",
+        "Overall CPL: " + (
+            format_report_money(overall["total_cpl"])
+            if overall["total_cpl"] is not None
+            else "N/A"
+        ),
+        "",
+    ]
+
+    if highest:
+        lines.extend([
+            f"🔴 Highest CPL ({highest.get('media_buyer', 'Unknown')})",
+            f"Spend: {format_report_money(highest.get('spend'))}",
+            f"Leads: {format_report_results(highest.get('results'))}",
+            f"CPL: {format_report_money(highest.get('cpl'))}",
+        ])
+    else:
+        lines.append("🔴 Highest CPL: No agent with valid leads and CPL")
+
+    lines.append("")
+
+    if lowest:
+        lines.extend([
+            f"🟢 Lowest CPL ({lowest.get('media_buyer', 'Unknown')})",
+            f"Spend: {format_report_money(lowest.get('spend'))}",
+            f"Leads: {format_report_results(lowest.get('results'))}",
+            f"CPL: {format_report_money(lowest.get('cpl'))}",
+        ])
+    else:
+        lines.append("🟢 Lowest CPL: No agent with valid leads and CPL")
+
+    male_alerts = pd.DataFrame()
+    if not gender_df.empty:
+        male_alerts = gender_df.copy()
+        if "gender" not in male_alerts.columns:
+            male_alerts["gender"] = "unknown"
+        if "spend" not in male_alerts.columns:
+            male_alerts["spend"] = 0
+        if "account_id" not in male_alerts.columns:
+            male_alerts["account_id"] = "Unknown"
+        if "account_name" not in male_alerts.columns:
+            male_alerts["account_name"] = "Unknown"
+        if "media_buyer" not in male_alerts.columns:
+            male_alerts["media_buyer"] = "Unknown"
+
+        male_alerts["gender"] = male_alerts["gender"].astype(str).str.lower().str.strip()
+        male_alerts["spend"] = pd.to_numeric(male_alerts["spend"], errors="coerce").fillna(0)
+        male_alerts = male_alerts[
+            (male_alerts["gender"] == "male") & (male_alerts["spend"] > 0)
+        ].copy()
+
+        if not male_alerts.empty:
+            male_alerts = (
+                male_alerts.groupby(
+                    ["account_id", "account_name", "media_buyer"],
+                    dropna=False,
+                )
+                .agg(spend=("spend", "sum"))
+                .reset_index()
+                .sort_values("spend", ascending=False)
+                .reset_index(drop=True)
+            )
+
+    lines.append("")
+    if male_alerts.empty:
+        lines.append("✅ Gender Alert: No Male Spend detected")
+    else:
+        lines.append(f"⚠️ Gender Alert: Male Spend detected in {len(male_alerts)} ad account(s)")
+        for index, row in male_alerts.iterrows():
+            lines.extend([
+                "",
+                f"Gender Alert #{index + 1}",
+                f"Male Spend: {format_report_money(row.get('spend'))}",
+                f"Agent name: {row.get('media_buyer', 'Unknown')}",
+                f"Ad account name: {row.get('account_name', 'Unknown')}",
+                f"Ad account ID: {row.get('account_id', 'Unknown')}",
+            ])
+
+    return "\n".join(lines).strip()
+
+
+def split_whatsapp_message(message, max_chars=3500):
+    if len(message) <= max_chars:
+        return [message]
+
+    chunks = []
+    current_lines = []
+    current_length = 0
+
+    for line in message.splitlines():
+        line_length = len(line) + 1
+        if current_lines and current_length + line_length > max_chars:
+            chunks.append("\n".join(current_lines).strip())
+            current_lines = []
+            current_length = 0
+
+        if len(line) > max_chars:
+            if current_lines:
+                chunks.append("\n".join(current_lines).strip())
+                current_lines = []
+                current_length = 0
+            for start in range(0, len(line), max_chars):
+                chunks.append(line[start:start + max_chars])
+            continue
+
+        current_lines.append(line)
+        current_length += line_length
+
+    if current_lines:
+        chunks.append("\n".join(current_lines).strip())
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"Meta Ads Refresh Report — Part {i}/{total}\n\n{chunk}" for i, chunk in enumerate(chunks, 1)]
+
+    return chunks
+
+
+def queue_whatsapp_refresh_report(fact, gender_df, quick_range, since, until):
+    job_id = uuid.uuid4().hex
+    range_label = make_refresh_range_label(quick_range, since, until)
+    message = build_whatsapp_refresh_report(fact, gender_df, range_label, since, until)
+    chunks = split_whatsapp_message(message)
+
+    job = {
+        "job_id": job_id,
+        "created_at": utc_now_iso(),
+        "range_label": range_label,
+        "date_from": str(since),
+        "date_to": str(until),
+        "chunks": chunks,
+    }
+    atomic_write_json(WHATSAPP_REPORT_JOB_FILE, job)
+    write_whatsapp_report_status(
+        "queued",
+        job_id=job_id,
+        range_label=range_label,
+        date_from=str(since),
+        date_to=str(until),
+        total_messages=len(chunks),
+        sent_messages=0,
+        error=None,
+        message_ids=[],
+        queued_at=utc_now_iso(),
+        dashboard_rendered=False,
+    )
+    return job_id
+
+
+def acquire_whatsapp_send_lock(job_id):
+    if WHATSAPP_REPORT_SEND_LOCK_FILE.exists():
+        try:
+            age = time.time() - WHATSAPP_REPORT_SEND_LOCK_FILE.stat().st_mtime
+            if age > WHATSAPP_REPORT_SEND_LOCK_MAX_AGE_SECONDS:
+                WHATSAPP_REPORT_SEND_LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            return False
+
+    try:
+        fd = os.open(
+            str(WHATSAPP_REPORT_SEND_LOCK_FILE),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"job_id": job_id, "created_at": time.time()}))
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+
+
+def release_whatsapp_send_lock():
+    try:
+        WHATSAPP_REPORT_SEND_LOCK_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def send_whatsapp_message_chunk(phone_number_id, access_token, recipient, api_version, body):
+    url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": body,
+        },
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=45)
+    if not response.ok:
+        try:
+            error_payload = response.json()
+            error_text = json.dumps(error_payload, ensure_ascii=False)
+        except Exception:
+            error_text = response.text
+        raise RuntimeError(f"WhatsApp API {response.status_code}: {error_text[:1500]}")
+    return response.json()
+
+
+def whatsapp_report_worker(job, config):
+    job_id = job.get("job_id")
+    chunks = job.get("chunks") or []
+    message_ids = []
+
+    try:
+        write_whatsapp_report_status_for_job(
+            job_id,
+            "sending",
+            started_at=utc_now_iso(),
+            total_messages=len(chunks),
+            sent_messages=0,
+            error=None,
+        )
+
+        for index, chunk in enumerate(chunks, start=1):
+            write_whatsapp_report_status_for_job(
+                job_id,
+                "sending",
+                current_message=index,
+                total_messages=len(chunks),
+                sent_messages=index - 1,
+            )
+            result = send_whatsapp_message_chunk(
+                phone_number_id=config["phone_number_id"],
+                access_token=config["access_token"],
+                recipient=config["recipient"],
+                api_version=config["api_version"],
+                body=chunk,
+            )
+            for item in result.get("messages", []):
+                message_id = item.get("id")
+                if message_id:
+                    message_ids.append(message_id)
+
+        write_whatsapp_report_status_for_job(
+            job_id,
+            "completed",
+            completed_at=utc_now_iso(),
+            total_messages=len(chunks),
+            sent_messages=len(chunks),
+            current_message=len(chunks),
+            message_ids=message_ids,
+            error=None,
+        )
+    except Exception as e:
+        safe_error = str(e)
+        access_token = config.get("access_token", "")
+        if access_token:
+            safe_error = safe_error.replace(access_token, "[REDACTED]")
+        write_whatsapp_report_status_for_job(
+            job_id,
+            "error",
+            failed_at=utc_now_iso(),
+            error=safe_error[:3000],
+            message_ids=message_ids,
+        )
+    finally:
+        release_whatsapp_send_lock()
+
+
+def mark_whatsapp_report_dashboard_rendered():
+    job = read_json_file(WHATSAPP_REPORT_JOB_FILE, {})
+    status = read_whatsapp_report_status()
+    job_id = job.get("job_id")
+    if not job_id or status.get("job_id") != job_id:
+        return
+    if status.get("dashboard_rendered"):
+        return
+    write_whatsapp_report_status(
+        status.get("state", "queued"),
+        job_id=job_id,
+        dashboard_rendered=True,
+    )
+
+
+def start_pending_whatsapp_report():
+    job = read_json_file(WHATSAPP_REPORT_JOB_FILE, {})
+    status = read_whatsapp_report_status()
+    if not job or not job.get("job_id"):
+        return
+
+    job_id = job.get("job_id")
+    if status.get("job_id") != job_id or status.get("state") != "queued":
+        return
+    if not status.get("dashboard_rendered"):
+        return
+
+    if not acquire_whatsapp_send_lock(job_id):
+        return
+
+    config = {
+        "access_token": get_config_value("WHATSAPP_ACCESS_TOKEN"),
+        "phone_number_id": get_config_value("WHATSAPP_PHONE_NUMBER_ID"),
+        "recipient": get_config_value("WHATSAPP_REPORT_TO"),
+        "api_version": get_config_value("WHATSAPP_API_VERSION", API_VERSION),
+    }
+
+    missing = [
+        name
+        for name, value in {
+            "WHATSAPP_ACCESS_TOKEN": config["access_token"],
+            "WHATSAPP_PHONE_NUMBER_ID": config["phone_number_id"],
+            "WHATSAPP_REPORT_TO": config["recipient"],
+        }.items()
+        if not value
+    ]
+    if missing:
+        write_whatsapp_report_status(
+            "error",
+            job_id=job_id,
+            failed_at=utc_now_iso(),
+            error=f"Missing Streamlit secret(s): {', '.join(missing)}",
+        )
+        release_whatsapp_send_lock()
+        return
+
+    thread = threading.Thread(
+        target=whatsapp_report_worker,
+        args=(job, config),
+        name=f"whatsapp-report-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _render_whatsapp_report_status_panel():
+    # This also lets a newly queued report start after an older send releases the lock.
+    start_pending_whatsapp_report()
+    st.markdown("### WhatsApp Report Status")
+    status = read_whatsapp_report_status()
+    if not status:
+        st.caption("No WhatsApp report has been queued yet.")
+        return
+
+    state = status.get("state", "unknown")
+    sent = int(status.get("sent_messages", 0) or 0)
+    total = int(status.get("total_messages", 0) or 0)
+    range_label = status.get("range_label", "-")
+
+    if state == "queued":
+        st.info(f"Queued after refresh — {range_label}")
+    elif state == "sending":
+        st.warning(f"Sending WhatsApp report: {sent}/{total}")
+    elif state == "completed":
+        st.success(f"WhatsApp report sent successfully: {sent}/{total}")
+    elif state == "error":
+        st.error("WhatsApp report failed. Dashboard data was not affected.")
+        if status.get("error"):
+            st.code(str(status.get("error")), language=None)
+    else:
+        st.caption(f"Status: {state}")
+
+    if status.get("updated_at"):
+        st.caption(f"Status updated: {status.get('updated_at')}")
+
+
+if hasattr(st, "fragment"):
+    render_whatsapp_report_status_panel = st.fragment(run_every="2s")(
+        _render_whatsapp_report_status_panel
+    )
+else:
+    render_whatsapp_report_status_panel = _render_whatsapp_report_status_panel
+
 
 # -----------------------------
 # Persistence
@@ -1339,6 +1821,9 @@ with st.sidebar:
     refresh_clicked = st.button("Refresh Data", use_container_width=True)
     force_unlock_clicked = st.button("Clear stuck refresh lock", use_container_width=True)
 
+    st.divider()
+    render_whatsapp_report_status_panel()
+
 if force_unlock_clicked:
     force_clear_refresh_lock()
     st.success("Refresh lock cleared. You can click Refresh Data now.")
@@ -1476,6 +1961,23 @@ if refresh_clicked:
                 balance_df=balance_df,
             )
 
+            try:
+                report_job_id = queue_whatsapp_refresh_report(
+                    fact=fact,
+                    gender_df=gender_df,
+                    quick_range=quick_range,
+                    since=since,
+                    until=until,
+                )
+                status.write(f"WhatsApp report queued: {report_job_id[:8]}")
+            except Exception as report_queue_error:
+                write_whatsapp_report_status(
+                    "error",
+                    failed_at=utc_now_iso(),
+                    error=f"Could not queue WhatsApp report: {report_queue_error}",
+                )
+                status.write("Data refresh succeeded, but WhatsApp report could not be queued.")
+
             status.update(label="Refresh complete. New snapshot saved.", state="complete")
             st.rerun()
 
@@ -1589,3 +2091,7 @@ with aud_tab2:
         st.info("No gender / age spend data by agent in the saved snapshot.")
     else:
         st.dataframe(format_display_df(audience_by_buyer), use_container_width=True, hide_index=True)
+
+# Mark the dashboard as rendered, then start WhatsApp delivery without blocking the UI.
+mark_whatsapp_report_dashboard_rendered()
+start_pending_whatsapp_report()
