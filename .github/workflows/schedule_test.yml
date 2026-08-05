@@ -1,0 +1,17 @@
+name: Schedule Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+jobs:
+  schedule-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Show trigger and time
+        run: |
+          echo "Triggered by: ${{ github.event_name }}"
+          echo "Current UTC time:"
+          date -u
