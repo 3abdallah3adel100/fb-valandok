@@ -360,6 +360,39 @@ def build_whatsapp_refresh_report(fact, gender_df, range_label, since, until):
     else:
         lines.append("🟢 Lowest CPL: No agent with valid leads and CPL")
 
+    # Full agent breakdown for the same selected refresh range.
+    lines.extend(["", "👥 Agents Details"])
+    agents_details = buyer_summary.copy()
+    if not agents_details.empty:
+        agents_details["spend"] = pd.to_numeric(agents_details["spend"], errors="coerce").fillna(0)
+        agents_details["results"] = pd.to_numeric(agents_details["results"], errors="coerce").fillna(0)
+        agents_details["cpl"] = pd.to_numeric(agents_details["cpl"], errors="coerce")
+        agents_details = agents_details[
+            agents_details["media_buyer"].astype(str).str.strip() != "Unknown"
+        ].copy()
+        agents_details = agents_details.sort_values(
+            ["spend", "media_buyer"],
+            ascending=[False, True],
+        ).reset_index(drop=True)
+
+    if agents_details.empty:
+        lines.append("No agent data found for this range")
+    else:
+        for index, row in agents_details.iterrows():
+            agent_cpl = row.get("cpl")
+            lines.extend([
+                "",
+                f"Agent #{index + 1}",
+                f"Agent name: {row.get('media_buyer', 'Unknown')}",
+                f"Spend: {format_report_money(row.get('spend'))}",
+                f"Leads: {format_report_results(row.get('results'))}",
+                "CPL: " + (
+                    format_report_money(agent_cpl)
+                    if pd.notna(agent_cpl)
+                    else "N/A"
+                ),
+            ])
+
     male_alerts = pd.DataFrame()
     if not gender_df.empty:
         male_alerts = gender_df.copy()
