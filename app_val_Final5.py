@@ -1621,6 +1621,7 @@ def build_unified_campaign_details(fact, media_buyer="🔵 Overall", objective_l
         "account_name": "Ad Account Name",
         "campaign_name": "Campaign",
         "campaign_status": "Campaign Status",
+        "ad_link": "Ad Link",
         "spend": "Spent",
         "results": "Results",
         "cpl": "CPL",
@@ -1681,6 +1682,7 @@ def render_media_buyer_campaign_details(fact):
             "Objective",
             "Campaign",
             "Campaign Status",
+            "Ad Link",
             "Spent",
             "Results",
             "CPL",
@@ -1694,11 +1696,19 @@ def render_media_buyer_campaign_details(fact):
         display_df = format_display_df(campaign_df[cols])
 
         sticky_cols = [c for c in ["Ad Account Name", "Media Buyer"] if c in display_df.columns]
+        link_column_config = {
+            "Ad Link": st.column_config.LinkColumn(
+                "Ad Link",
+                display_text="Open Ad",
+                width="small",
+            )
+        } if "Ad Link" in display_df.columns else {}
+
         if sticky_cols:
             display_df = display_df.set_index(sticky_cols)
-            st.dataframe(display_df, use_container_width=True)
+            st.dataframe(display_df, use_container_width=True, column_config=link_column_config)
         else:
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=link_column_config)
 
 def render_overall_agent_section(fact):
     st.subheader("👥 Overall Agent")
@@ -1750,6 +1760,18 @@ def build_campaign_summary(fact):
             if not status_values.empty:
                 campaign_status = status_values.iloc[0]
 
+        account_id = ""
+        if "account_id" in grp.columns:
+            account_ids = grp["account_id"].dropna().astype(str)
+            if not account_ids.empty:
+                account_id = normalize_account_id(account_ids.iloc[0])
+
+        ad_link = (
+            f"https://adsmanager.facebook.com/adsmanager/manage/ads?act={account_id}&selected_campaign_ids={campaign_id}"
+            if account_id and pd.notna(campaign_id)
+            else ""
+        )
+
         rows.append({
             "media_buyer": media_buyer,
             "objective_label": objective_label,
@@ -1757,6 +1779,7 @@ def build_campaign_summary(fact):
             "campaign_id": campaign_id,
             "campaign_name": campaign_name,
             "campaign_status": campaign_status,
+            "ad_link": ad_link,
             "spend": spend,
             "results": results,
             "cpl": safe_div(spend, results),
