@@ -1080,6 +1080,58 @@ def get_campaigns(account_id):
     return df
 
 @st.cache_data(ttl=1800)
+def get_campaign_creative_links(account_id):
+    clean_id = str(account_id).replace("act_", "")
+    url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/ads"
+    params = {
+        "fields": "id,campaign_id,effective_status,creative{effective_object_story_id,instagram_permalink_url,effective_instagram_media_id}",
+        "access_token": ACCESS_TOKEN,
+        "limit": 1000,
+    }
+
+    rows = fetch_all_pages(url, params)
+    if not rows:
+        return pd.DataFrame(columns=["campaign_id", "creative_link"])
+
+    candidates = []
+    for row in rows:
+        campaign_id = str(row.get("campaign_id") or "").strip()
+        ad_id = str(row.get("id") or "").strip()
+        creative = row.get("creative") if isinstance(row.get("creative"), dict) else {}
+
+        creative_link = str(creative.get("instagram_permalink_url") or "").strip()
+
+        if not creative_link:
+            story_id = str(creative.get("effective_object_story_id") or "").strip()
+            if "_" in story_id:
+                page_id, post_id = story_id.split("_", 1)
+                if page_id and post_id:
+                    creative_link = f"https://www.facebook.com/{page_id}/posts/{post_id}"
+
+        # Safe fallback when Meta does not expose a direct post / Instagram permalink.
+        if not creative_link and ad_id:
+            creative_link = f"https://www.facebook.com/ads/library/?id={ad_id}"
+
+        if campaign_id and creative_link:
+            candidates.append({
+                "campaign_id": campaign_id,
+                "creative_link": creative_link,
+                "_active_rank": 0 if normalize_text(row.get("effective_status")) == "ACTIVE" else 1,
+            })
+
+    if not candidates:
+        return pd.DataFrame(columns=["campaign_id", "creative_link"])
+
+    out = pd.DataFrame(candidates)
+    out = (
+        out.sort_values(["campaign_id", "_active_rank"])
+        .drop_duplicates(subset=["campaign_id"], keep="first")
+        .drop(columns=["_active_rank"], errors="ignore")
+        .reset_index(drop=True)
+    )
+    return out
+
+@st.cache_data(ttl=1800)
 def get_insights_for_account(account_id, since, until):
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
@@ -1262,6 +1314,18 @@ def fetch_one_account(row, since, until):
         if FETCH_CAMPAIGNS:
             campaigns_df = get_campaigns(account_id)
         insights_df = get_insights_for_account(account_id, str(since), str(until))
+
+        # Creative URL enrichment is isolated so a Meta creative-permission issue
+        # never affects the existing dashboard refresh or campaign metrics.
+        try:
+            creative_links_df = get_campaign_creative_links(account_id)
+            if not insights_df.empty and not creative_links_df.empty and "campaign_id" in insights_df.columns:
+                insights_df["campaign_id"] = insights_df["campaign_id"].astype(str)
+                creative_links_df["campaign_id"] = creative_links_df["campaign_id"].astype(str)
+                insights_df = insights_df.merge(creative_links_df, on="campaign_id", how="left")
+        except Exception:
+            if "creative_link" not in insights_df.columns:
+                insights_df["creative_link"] = ""
 
         try:
             age_gender_df = get_age_gender_spend(account_id, str(since), str(until))
@@ -1622,6 +1686,7 @@ def build_unified_campaign_details(fact, media_buyer="🔵 Overall", objective_l
         "campaign_name": "Campaign",
         "campaign_status": "Campaign Status",
         "ad_link": "Ad Link",
+        "creative_link": "Creative Link",
         "spend": "Spent",
         "results": "Results",
         "cpl": "CPL",
@@ -1682,7 +1747,6 @@ def render_media_buyer_campaign_details(fact):
             "Objective",
             "Campaign",
             "Campaign Status",
-            "Ad Link",
             "Spent",
             "Results",
             "CPL",
@@ -1691,18 +1755,26 @@ def render_media_buyer_campaign_details(fact):
             "Frequency",
             "impressions",
             "clicks",
+            "Ad Link",
+            "Creative Link",
         ]
         cols = [c for c in cols if c in campaign_df.columns]
         display_df = format_display_df(campaign_df[cols])
 
         sticky_cols = [c for c in ["Ad Account Name", "Media Buyer"] if c in display_df.columns]
-        link_column_config = {
-            "Ad Link": st.column_config.LinkColumn(
+        link_column_config = {}
+        if "Ad Link" in display_df.columns:
+            link_column_config["Ad Link"] = st.column_config.LinkColumn(
                 "Ad Link",
                 display_text="Open Ad",
                 width="small",
             )
-        } if "Ad Link" in display_df.columns else {}
+        if "Creative Link" in display_df.columns:
+            link_column_config["Creative Link"] = st.column_config.LinkColumn(
+                "Creative Link",
+                display_text="Open Creative",
+                width="small",
+            )
 
         if sticky_cols:
             display_df = display_df.set_index(sticky_cols)
@@ -1772,6 +1844,13 @@ def build_campaign_summary(fact):
             else ""
         )
 
+        creative_link = ""
+        if "creative_link" in grp.columns:
+            creative_links = grp["creative_link"].dropna().astype(str)
+            creative_links = creative_links[creative_links.str.strip() != ""]
+            if not creative_links.empty:
+                creative_link = creative_links.iloc[0]
+
         rows.append({
             "media_buyer": media_buyer,
             "objective_label": objective_label,
@@ -1780,6 +1859,7 @@ def build_campaign_summary(fact):
             "campaign_name": campaign_name,
             "campaign_status": campaign_status,
             "ad_link": ad_link,
+            "creative_link": creative_link,
             "spend": spend,
             "results": results,
             "cpl": safe_div(spend, results),
