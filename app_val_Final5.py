@@ -53,7 +53,7 @@ if not META_ACCESS_TOKENS:
     st.error("Missing Streamlit secret: META_ACCESS_TOKEN")
     st.stop()
 
-BUSINESS_IDS = ["751488620224306", "1178859133269743"]
+BUSINESS_IDS = ["751488620224306", "1178859133269743","1370772291128896"]
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
 
