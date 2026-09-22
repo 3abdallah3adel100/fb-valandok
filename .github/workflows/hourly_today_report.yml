@@ -30,8 +30,11 @@ jobs:
       - name: Fetch Today data and send WhatsApp report
         env:
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_ACCESS_TOKEN_2: ${{ secrets.META_ACCESS_TOKEN_2 }}
           META_API_VERSION: ${{ secrets.META_API_VERSION }}
-          BUSINESS_IDS: ${{ secrets.BUSINESS_IDS }}
+          # The same GitHub Variable used by Taher smart reports.
+          # When missing/empty, Python uses the three IDs in DEFAULT_BUSINESS_IDS.
+          BUSINESS_IDS: ${{ vars.TAHER_BUSINESS_IDS }}
           WHATSAPP_ACCESS_TOKEN: ${{ secrets.WHATSAPP_ACCESS_TOKEN }}
           WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
           WHATSAPP_REPORT_TO: ${{ secrets.WHATSAPP_REPORT_TO }}
