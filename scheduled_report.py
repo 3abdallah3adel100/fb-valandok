@@ -6,14 +6,15 @@ This script is intentionally independent from Streamlit. It:
 3) sends it to one or many recipients.
 
 Required environment variables:
-- META_ACCESS_TOKEN
+- META_ACCESS_TOKEN (existing Meta token)
 - WHATSAPP_ACCESS_TOKEN
 - WHATSAPP_PHONE_NUMBER_ID
 - WHATSAPP_REPORT_TO (comma/semicolon/newline-separated international numbers)
 
 Optional environment variables:
+- META_ACCESS_TOKEN_2 (second Meta token)
 - META_API_VERSION (default: v25.0)
-- BUSINESS_IDS (default: the two dashboard business IDs)
+- BUSINESS_IDS (defaults to Taher's three configured businesses)
 - REPORT_TIMEZONE (default: Africa/Cairo)
 - MAX_WORKERS (default: 4)
 """
@@ -34,7 +35,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 BASE_URL = "https://graph.facebook.com"
-DEFAULT_BUSINESS_IDS = ["751488620224306", "1178859133269743"]
+DEFAULT_BUSINESS_IDS = ["751488620224306", "1178859133269743", "1370772291128896"]
 
 MEDIA_BUYER_MAP = {
     "AA": "Abdallah Adel",
@@ -52,7 +53,7 @@ MEDIA_BUYER_MAP = {
 
 @dataclass(frozen=True)
 class Config:
-    meta_access_token: str
+    meta_access_tokens: dict[str, str]
     whatsapp_access_token: str
     whatsapp_phone_number_id: str
     recipients: list[str]
@@ -89,9 +90,17 @@ def load_config() -> Config:
     if not recipients:
         raise RuntimeError("WHATSAPP_REPORT_TO does not contain any valid numbers")
 
-    business_ids = split_values(os.getenv("BUSINESS_IDS", ",".join(DEFAULT_BUSINESS_IDS)))
-    if not business_ids:
-        business_ids = DEFAULT_BUSINESS_IDS.copy()
+    business_ids = split_values(os.getenv("BUSINESS_IDS", "")) or DEFAULT_BUSINESS_IDS.copy()
+    # Unique IDs in declared order; no accidental duplicate source requests.
+    business_ids = list(dict.fromkeys(business_ids))
+    invalid_ids = [business_id for business_id in business_ids if not business_id.isdigit()]
+    if invalid_ids:
+        raise RuntimeError("BUSINESS_IDS must contain numeric Business IDs separated by commas")
+
+    meta_tokens = {"token_1": require_env("META_ACCESS_TOKEN")}
+    second_token = os.getenv("META_ACCESS_TOKEN_2", "").strip()
+    if second_token and second_token != meta_tokens["token_1"]:
+        meta_tokens["token_2"] = second_token
 
     try:
         max_workers = max(1, min(10, int(os.getenv("MAX_WORKERS", "4"))))
@@ -99,7 +108,7 @@ def load_config() -> Config:
         max_workers = 4
 
     return Config(
-        meta_access_token=require_env("META_ACCESS_TOKEN"),
+        meta_access_tokens=meta_tokens,
         whatsapp_access_token=require_env("WHATSAPP_ACCESS_TOKEN"),
         whatsapp_phone_number_id=require_env("WHATSAPP_PHONE_NUMBER_ID"),
         recipients=recipients,
@@ -140,10 +149,6 @@ def extract_buyer_code(account_name: str) -> str:
 def is_relevant_account_name(account_name: str) -> bool:
     text = normalize_text(account_name)
     return any(marker in text for marker in ("OK-FB-HR-", "OK-FB-NF-", "US-FB-HR-", "US-BO-HR-"))
-
-
-def source_is_okaby(source: str) -> bool:
-    return "751488620224306" in str(source)
 
 
 def classify_objective(campaign_name: str) -> str:
@@ -227,75 +232,137 @@ def fetch_all_pages(url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def redact_secrets(config: Config, message: Any) -> str:
+    """Never print actual Meta/WhatsApp access tokens in GitHub Actions logs."""
+    safe = str(message)
+    secrets = list(config.meta_access_tokens.values()) + [config.whatsapp_access_token]
+    for secret in secrets:
+        if secret:
+            safe = safe.replace(secret, "[REDACTED]")
+    return safe
+
+
 def get_ad_accounts(config: Config) -> list[dict[str, Any]]:
-    sources: list[tuple[str, str]] = [
-        ("me/adaccounts", f"{BASE_URL}/{config.api_version}/me/adaccounts")
-    ]
-    for business_id in config.business_ids:
-        sources.extend([
-            (f"business/{business_id}/owned_ad_accounts", f"{BASE_URL}/{config.api_version}/{business_id}/owned_ad_accounts"),
-            (f"business/{business_id}/client_ad_accounts", f"{BASE_URL}/{config.api_version}/{business_id}/client_ad_accounts"),
-        ])
+    """Discover accounts from both tokens and every explicitly configured business.
 
+    All accounts returned from configured businesses are eligible, regardless of name.
+    /me/adaccounts-only accounts still require the original naming convention.
+    Deduplicate by account ID while remembering usable token labels for fallback.
+    """
     collected: list[dict[str, Any]] = []
-    for source_name, url in sources:
-        try:
-            rows = fetch_all_pages(url, {
-                "fields": "id,account_id,name,account_status",
-                "access_token": config.meta_access_token,
-                "limit": 500,
-            })
-            for row in rows:
-                row = dict(row)
-                row["source"] = source_name
-                collected.append(row)
-        except Exception as exc:
-            print(f"WARNING account source failed: {source_name}: {exc}", file=sys.stderr)
+    business_accounts: dict[str, set[str]] = {bid: set() for bid in config.business_ids}
 
-    filtered = [
-        row for row in collected
-        if is_relevant_account_name(str(row.get("name", ""))) or source_is_okaby(str(row.get("source", "")))
-    ]
+    for token_key, access_token in config.meta_access_tokens.items():
+        sources: list[tuple[str, str, str | None]] = [
+            ("me/adaccounts", f"{BASE_URL}/{config.api_version}/me/adaccounts", None)
+        ]
+        for business_id in config.business_ids:
+            sources.extend([
+                (f"business/{business_id}/owned_ad_accounts",
+                 f"{BASE_URL}/{config.api_version}/{business_id}/owned_ad_accounts", business_id),
+                (f"business/{business_id}/client_ad_accounts",
+                 f"{BASE_URL}/{config.api_version}/{business_id}/client_ad_accounts", business_id),
+            ])
+
+        for source_name, url, business_id in sources:
+            try:
+                rows = fetch_all_pages(url, {
+                    "fields": "id,account_id,name,account_status",
+                    "access_token": access_token,
+                    "limit": 500,
+                })
+                print(f"Account source {source_name} ({token_key}): {len(rows)} row(s)")
+                for row in rows:
+                    account = dict(row)
+                    account_id = str(account.get("id") or "").replace("act_", "")
+                    if not account_id:
+                        continue
+                    account["id"] = f"act_{account_id}"
+                    account["source"] = source_name
+                    account["_token_key"] = token_key  # label, never the actual token
+                    collected.append(account)
+                    if business_id is not None:
+                        business_accounts[business_id].add(account_id)
+            except Exception as exc:
+                print(
+                    f"WARNING account source failed: {source_name} ({token_key}): "
+                    f"{redact_secrets(config, exc)}",
+                    file=sys.stderr,
+                )
+
+    # Keep every candidate-token path for accounts that belong to a configured
+    # business, even if another token only sees that account via /me/adaccounts.
+    eligible_ids = {
+        row["id"] for row in collected
+        if row["source"] != "me/adaccounts"
+        or is_relevant_account_name(str(row.get("name", "")))
+    }
 
     dedup: dict[str, dict[str, Any]] = {}
-    for row in filtered:
-        account_id = str(row.get("id") or "")
-        if account_id and account_id not in dedup:
-            dedup[account_id] = row
+    for row in collected:
+        account_id = row["id"]
+        if account_id not in eligible_ids:
+            continue
+        if account_id not in dedup:
+            dedup[account_id] = {
+                key: value for key, value in row.items() if key != "_token_key"
+            }
+            dedup[account_id]["_token_keys"] = []
+        token_keys = dedup[account_id]["_token_keys"]
+        if row["_token_key"] not in token_keys:
+            token_keys.append(row["_token_key"])
+        # Favor the explicit business source over /me for auditability.
+        if dedup[account_id]["source"] == "me/adaccounts" and row["source"] != "me/adaccounts":
+            dedup[account_id]["source"] = row["source"]
+
+    for business_id in config.business_ids:
+        print(f"Configured business {business_id}: {len(business_accounts[business_id])} unique account(s) discovered")
+    print(f"Unique relevant ad accounts across tokens: {len(dedup)}")
     return list(dedup.values())
 
 
 def get_account_data(config: Config, account: dict[str, Any], day: str) -> dict[str, Any]:
     account_id = str(account.get("id", "")).replace("act_", "")
     account_name = str(account.get("name") or account_id)
-
     insights_url = f"{BASE_URL}/{config.api_version}/act_{account_id}/insights"
-    common = {
-        "time_range": json.dumps({"since": day, "until": day}),
-        "access_token": config.meta_access_token,
-        "limit": 1000,
-    }
 
-    insights = fetch_all_pages(insights_url, {
-        **common,
-        "fields": ",".join([
-            "account_id", "account_name", "campaign_id", "campaign_name", "spend", "actions"
-        ]),
-        "level": "campaign",
-    })
+    preferred_keys = account.get("_token_keys") or []
+    token_keys = list(dict.fromkeys(
+        [key for key in preferred_keys if key in config.meta_access_tokens]
+        + list(config.meta_access_tokens)
+    ))
+    errors: list[str] = []
 
-    genders = fetch_all_pages(insights_url, {
-        **common,
-        "fields": "spend",
-        "breakdowns": "gender",
-    })
+    for token_key in token_keys:
+        common = {
+            "time_range": json.dumps({"since": day, "until": day}),
+            "access_token": config.meta_access_tokens[token_key],
+            "limit": 1000,
+        }
+        try:
+            insights = fetch_all_pages(insights_url, {
+                **common,
+                "fields": ",".join([
+                    "account_id", "account_name", "campaign_id", "campaign_name", "spend", "actions"
+                ]),
+                "level": "campaign",
+            })
+            genders = fetch_all_pages(insights_url, {
+                **common,
+                "fields": "spend",
+                "breakdowns": "gender",
+            })
+            return {
+                "account_id": f"act_{account_id}",
+                "account_name": account_name,
+                "insights": insights,
+                "genders": genders,
+                "token_key": token_key,  # safe label for logs, never the secret
+            }
+        except Exception as exc:
+            errors.append(f"{token_key}: {redact_secrets(config, exc)}")
 
-    return {
-        "account_id": f"act_{account_id}",
-        "account_name": account_name,
-        "insights": insights,
-        "genders": genders,
-    }
+    raise RuntimeError(f"All Meta tokens failed for account {account_id}: {'; '.join(errors)}")
 
 
 def aggregate(accounts_data: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -474,6 +541,8 @@ def main() -> int:
     day = now.date().isoformat()
     print(f"Starting Today report for {day} ({config.timezone})")
     print(f"API version: {config.api_version}")
+    print(f"Configured businesses: {', '.join(config.business_ids)}")
+    print(f"Configured Meta tokens: {', '.join(config.meta_access_tokens)} (labels only)")
 
     accounts = get_ad_accounts(config)
     if not accounts:
@@ -489,17 +558,23 @@ def main() -> int:
             try:
                 result = future.result()
                 account_results.append(result)
-                print(f"Fetched: {result['account_name']}")
+                print(f"Fetched: {result['account_name']} ({result['token_key']})")
             except Exception as exc:
                 name = str(account.get("name") or account.get("id") or "Unknown")
-                fetch_errors.append(f"{name}: {exc}")
-                print(f"ERROR fetch {name}: {exc}", file=sys.stderr)
+                safe_error = redact_secrets(config, exc)
+                fetch_errors.append(f"{name}: {safe_error}")
+                print(f"ERROR fetch {name}: {safe_error}", file=sys.stderr)
 
     if not account_results:
         raise RuntimeError("All account fetches failed")
 
     agents, male_alerts = aggregate(account_results)
     report = build_report(day, agents, male_alerts)
+    if fetch_errors:
+        report += (
+            f"\n\n⚠️ Data coverage: {len(account_results)}/{len(accounts)} accounts fetched. "
+            f"{len(fetch_errors)} account(s) failed, so totals and gender alerts may be incomplete."
+        )
     chunks = split_message(report)
 
     print("\n--- REPORT PREVIEW ---\n")
@@ -515,7 +590,7 @@ def main() -> int:
             success += 1
             print(f"Sent successfully to {mask_phone(recipient)}")
         except Exception as exc:
-            safe_error = str(exc).replace(config.whatsapp_access_token, "[REDACTED]")
+            safe_error = redact_secrets(config, exc)
             failures.append(f"{mask_phone(recipient)}: {safe_error}")
             print(f"ERROR sending to {mask_phone(recipient)}: {safe_error}", file=sys.stderr)
 
