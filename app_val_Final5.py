@@ -38,7 +38,21 @@ if not check_password():
 
 BASE_URL = "https://graph.facebook.com"
 API_VERSION = st.secrets.get("META_API_VERSION", "v17.0")
-ACCESS_TOKEN = st.secrets["META_ACCESS_TOKEN"]
+
+# Meta Ads access tokens. Keep the real token values only in Streamlit Secrets.
+# token_2 is optional, so the app still works with the original token only.
+META_ACCESS_TOKENS = {
+    "token_1": str(st.secrets.get("META_ACCESS_TOKEN", "")).strip(),
+    "token_2": str(st.secrets.get("META_ACCESS_TOKEN_2", "")).strip(),
+}
+META_ACCESS_TOKENS = {
+    key: value for key, value in META_ACCESS_TOKENS.items() if value
+}
+
+if not META_ACCESS_TOKENS:
+    st.error("Missing Streamlit secret: META_ACCESS_TOKEN")
+    st.stop()
+
 BUSINESS_IDS = ["751488620224306", "1178859133269743"]
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
@@ -1015,62 +1029,110 @@ def fetch_all_pages(url, params=None):
 
 @st.cache_data(ttl=1800)
 def get_ad_accounts():
+    """Fetch relevant ad accounts across every configured Meta access token.
+
+    The dataframe stores only a safe token label (token_key), never the real token.
+    The token label is later used so each account's API calls use a token that can
+    actually access that account.
+    """
     all_dfs = []
 
-    sources = [
-        ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
-    ]
-    for business_id in BUSINESS_IDS:
-        sources.extend([
-            (f"business/{business_id}/owned_ad_accounts", f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts"),
-            (f"business/{business_id}/client_ad_accounts", f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts"),
-        ])
+    for token_key, access_token in META_ACCESS_TOKENS.items():
+        sources = [
+            ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
+        ]
 
-    for source_name, url in sources:
-        try:
-            params = {
-                "fields": "id,account_id,name,account_status,currency,funding_source_details",
-                "access_token": ACCESS_TOKEN,
-                "limit": 500,
-            }
-            rows = fetch_all_pages(url, params)
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                df["source"] = source_name
-                all_dfs.append(df)
-        except Exception:
-            pass
+        for business_id in BUSINESS_IDS:
+            sources.extend([
+                (
+                    f"business/{business_id}/owned_ad_accounts",
+                    f"{BASE_URL}/{API_VERSION}/{business_id}/owned_ad_accounts",
+                ),
+                (
+                    f"business/{business_id}/client_ad_accounts",
+                    f"{BASE_URL}/{API_VERSION}/{business_id}/client_ad_accounts",
+                ),
+            ])
+
+        for source_name, url in sources:
+            try:
+                params = {
+                    "fields": "id,account_id,name,account_status,currency,funding_source_details",
+                    "access_token": access_token,
+                    "limit": 500,
+                }
+                rows = fetch_all_pages(url, params)
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    df["source"] = source_name
+                    df["token_key"] = token_key
+                    all_dfs.append(df)
+            except Exception:
+                # One token may not have access to one of the configured businesses.
+                # That should not block accounts available through the other token.
+                pass
 
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame()
 
     raw_accounts = pd.concat(all_dfs, ignore_index=True)
 
-    # Speed optimization with safe Unknown handling:
-    # - Fetch all El-Okaby business accounts, even if naming is not coded correctly.
-    #   These will appear under Media Buyer = Unknown.
-    # - Fetch VAL accounts only when they match VAL Hair / VAL Booty naming.
-    # - Keep matching accounts from /me/adaccounts as well.
+    # Preserve the dashboard's existing account relevance rules:
+    # - All El-Okaby business accounts are kept, even with an unknown naming code.
+    # - VAL / other accounts are kept when their account names match the configured
+    #   naming patterns in is_relevant_account_name().
+    # - Matching accounts discovered via /me/adaccounts are also kept.
     if "name" in raw_accounts.columns:
         name_match = raw_accounts["name"].apply(is_relevant_account_name)
-        okaby_source = raw_accounts["source"].apply(source_is_okaby) if "source" in raw_accounts.columns else False
+        okaby_source = (
+            raw_accounts["source"].apply(source_is_okaby)
+            if "source" in raw_accounts.columns
+            else False
+        )
         raw_accounts = raw_accounts[name_match | okaby_source].copy()
 
+    # The same ad account can appear through /me, a business endpoint, or both tokens.
+    # Keep one account row and retain the token_key of a token that successfully
+    # discovered it. token_1 wins when both tokens can see the same account.
+    token_priority = {key: i for i, key in enumerate(META_ACCESS_TOKENS.keys())}
+    raw_accounts["_token_priority"] = (
+        raw_accounts.get("token_key", pd.Series(index=raw_accounts.index, dtype=object))
+        .map(token_priority)
+        .fillna(999)
+    )
+
     dedup = raw_accounts.copy()
+    sort_cols = [c for c in ["name", "_token_priority", "source"] if c in dedup.columns]
+    if sort_cols:
+        dedup = dedup.sort_values(sort_cols)
+
     if "id" in dedup.columns:
-        dedup = dedup.sort_values(["name", "source"]).drop_duplicates(subset=["id"], keep="first")
+        dedup = dedup.drop_duplicates(subset=["id"], keep="first")
     elif "account_id" in dedup.columns:
-        dedup = dedup.sort_values(["name", "source"]).drop_duplicates(subset=["account_id"], keep="first")
+        dedup = dedup.drop_duplicates(subset=["account_id"], keep="first")
+
+    dedup = dedup.drop(columns=["_token_priority"], errors="ignore")
+    raw_accounts = raw_accounts.drop(columns=["_token_priority"], errors="ignore")
 
     return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True)
 
+
+def get_meta_access_token(token_key):
+    """Resolve a safe token label to the real token stored in Streamlit Secrets."""
+    token_key = str(token_key or "token_1")
+    token = META_ACCESS_TOKENS.get(token_key)
+    if not token:
+        token = META_ACCESS_TOKENS.get("token_1") or next(iter(META_ACCESS_TOKENS.values()))
+    return token
+
 @st.cache_data(ttl=1800)
-def get_campaigns(account_id):
+def get_campaigns(account_id, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/campaigns"
     params = {
         "fields": "id,name,status,effective_status",
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
     rows = fetch_all_pages(url, params)
@@ -1080,12 +1142,13 @@ def get_campaigns(account_id):
     return df
 
 @st.cache_data(ttl=1800)
-def get_campaign_creative_links(account_id):
+def get_campaign_creative_links(account_id, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/ads"
     params = {
         "fields": "id,campaign_id,effective_status,creative{effective_object_story_id,instagram_permalink_url,effective_instagram_media_id}",
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
 
@@ -1132,7 +1195,8 @@ def get_campaign_creative_links(account_id):
     return out
 
 @st.cache_data(ttl=1800)
-def get_insights_for_account(account_id, since, until):
+def get_insights_for_account(account_id, since, until, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
     params = {
@@ -1153,7 +1217,7 @@ def get_insights_for_account(account_id, since, until):
         ]),
         "level": "campaign",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
 
@@ -1166,14 +1230,15 @@ def get_insights_for_account(account_id, since, until):
     return df
 
 @st.cache_data(ttl=1800)
-def get_gender_spend(account_id, since, until):
+def get_gender_spend(account_id, since, until, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
     params = {
         "fields": "spend",
         "breakdowns": "gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
 
@@ -1191,14 +1256,15 @@ def get_gender_spend(account_id, since, until):
     return df
 
 @st.cache_data(ttl=1800)
-def get_age_spend(account_id, since, until):
+def get_age_spend(account_id, since, until, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
     params = {
         "fields": "spend",
         "breakdowns": "age",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
 
@@ -1216,14 +1282,15 @@ def get_age_spend(account_id, since, until):
     return df
 
 @st.cache_data(ttl=1800)
-def get_age_gender_spend(account_id, since, until):
+def get_age_gender_spend(account_id, since, until, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}/insights"
     params = {
         "fields": "spend",
         "breakdowns": "age,gender",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
         "limit": 1000,
     }
 
@@ -1274,12 +1341,13 @@ def parse_balance_from_display_string(display_string):
     return to_float(match.group(1).replace(",", ""), default=None)
 
 @st.cache_data(ttl=1800)
-def get_account_balance(account_id):
+def get_account_balance(account_id, token_key="token_1"):
+    access_token = get_meta_access_token(token_key)
     clean_id = str(account_id).replace("act_", "")
     url = f"{BASE_URL}/{API_VERSION}/act_{clean_id}"
     params = {
         "fields": "name,funding_source_details",
-        "access_token": ACCESS_TOKEN,
+        "access_token": access_token,
     }
 
     response = requests.get(url, params=params, timeout=90)
@@ -1302,51 +1370,88 @@ def get_account_balance(account_id):
 def fetch_one_account(row, since, until):
     account_id = row["id"]
     account_name = row.get("name", account_id)
+    primary_token_key = row.get("token_key", "token_1")
 
-    campaigns_df = pd.DataFrame()
-    insights_df = pd.DataFrame()
-    gender_df = pd.DataFrame()
-    age_df = pd.DataFrame()
-    balance_row = {}
-    error = None
+    # Try the token that discovered the account first. If it cannot read the
+    # account metrics, automatically try the other configured token(s).
+    token_candidates = [primary_token_key] + [
+        key for key in META_ACCESS_TOKENS.keys() if key != primary_token_key
+    ]
 
-    try:
-        if FETCH_CAMPAIGNS:
-            campaigns_df = get_campaigns(account_id)
-        insights_df = get_insights_for_account(account_id, str(since), str(until))
+    last_error = None
 
-        # Creative URL enrichment is isolated so a Meta creative-permission issue
-        # never affects the existing dashboard refresh or campaign metrics.
-        try:
-            creative_links_df = get_campaign_creative_links(account_id)
-            if not insights_df.empty and not creative_links_df.empty and "campaign_id" in insights_df.columns:
-                insights_df["campaign_id"] = insights_df["campaign_id"].astype(str)
-                creative_links_df["campaign_id"] = creative_links_df["campaign_id"].astype(str)
-                insights_df = insights_df.merge(creative_links_df, on="campaign_id", how="left")
-        except Exception:
-            if "creative_link" not in insights_df.columns:
-                insights_df["creative_link"] = ""
-
-        try:
-            age_gender_df = get_age_gender_spend(account_id, str(since), str(until))
-            gender_df, age_df = split_age_gender_breakdown(age_gender_df)
-        except Exception:
-            gender_df = get_gender_spend(account_id, str(since), str(until))
-            age_df = get_age_spend(account_id, str(since), str(until))
-
+    for token_key in token_candidates:
+        campaigns_df = pd.DataFrame()
+        insights_df = pd.DataFrame()
+        gender_df = pd.DataFrame()
+        age_df = pd.DataFrame()
         balance_row = {}
-    except Exception as e:
-        error = f"{account_name}: {e}"
+
+        try:
+            if FETCH_CAMPAIGNS:
+                campaigns_df = get_campaigns(account_id, token_key)
+
+            insights_df = get_insights_for_account(
+                account_id, str(since), str(until), token_key
+            )
+
+            # Creative URL enrichment is isolated so a Meta creative-permission
+            # issue never affects the dashboard refresh or campaign metrics.
+            try:
+                creative_links_df = get_campaign_creative_links(account_id, token_key)
+                if (
+                    not insights_df.empty
+                    and not creative_links_df.empty
+                    and "campaign_id" in insights_df.columns
+                ):
+                    insights_df["campaign_id"] = insights_df["campaign_id"].astype(str)
+                    creative_links_df["campaign_id"] = creative_links_df["campaign_id"].astype(str)
+                    insights_df = insights_df.merge(
+                        creative_links_df, on="campaign_id", how="left"
+                    )
+            except Exception:
+                if "creative_link" not in insights_df.columns:
+                    insights_df["creative_link"] = ""
+
+            try:
+                age_gender_df = get_age_gender_spend(
+                    account_id, str(since), str(until), token_key
+                )
+                gender_df, age_df = split_age_gender_breakdown(age_gender_df)
+            except Exception:
+                gender_df = get_gender_spend(
+                    account_id, str(since), str(until), token_key
+                )
+                age_df = get_age_spend(
+                    account_id, str(since), str(until), token_key
+                )
+
+            return {
+                "account_id": account_id,
+                "account_name": account_name,
+                "token_key": token_key,
+                "campaigns_df": campaigns_df,
+                "insights_df": insights_df,
+                "gender_df": gender_df,
+                "age_df": age_df,
+                "balance_row": balance_row,
+                "error": None,
+            }
+
+        except Exception as e:
+            last_error = e
+            continue
 
     return {
         "account_id": account_id,
         "account_name": account_name,
-        "campaigns_df": campaigns_df,
-        "insights_df": insights_df,
-        "gender_df": gender_df,
-        "age_df": age_df,
-        "balance_row": balance_row,
-        "error": error,
+        "token_key": primary_token_key,
+        "campaigns_df": pd.DataFrame(),
+        "insights_df": pd.DataFrame(),
+        "gender_df": pd.DataFrame(),
+        "age_df": pd.DataFrame(),
+        "balance_row": {},
+        "error": f"{account_name}: {last_error}",
     }
 
 # -----------------------------
@@ -1876,11 +1981,18 @@ def build_account_sources_table(raw_accounts):
     if raw_accounts.empty:
         return pd.DataFrame()
 
+    agg_map = {
+        "sources": ("source", lambda x: ", ".join(sorted(set(str(v) for v in x if pd.notna(v)))))
+    }
+    if "token_key" in raw_accounts.columns:
+        agg_map["token_keys"] = (
+            "token_key",
+            lambda x: ", ".join(sorted(set(str(v) for v in x if pd.notna(v))))
+        )
+
     out = (
         raw_accounts.groupby(["id", "account_id", "name"], dropna=False)
-        .agg(
-            sources=("source", lambda x: ", ".join(sorted(set(x))))
-        )
+        .agg(**agg_map)
         .reset_index()
         .sort_values("name")
         .reset_index(drop=True)
@@ -2161,7 +2273,18 @@ if refresh_clicked:
 
         with st.status("Refreshing data in background-like flow...", expanded=True) as status:
             accounts_df, raw_accounts_df = get_ad_accounts()
-            status.write(f"Loaded {len(accounts_df)} relevant ad accounts from configured businesses.")
+            token_counts = (
+                accounts_df["token_key"].value_counts().to_dict()
+                if "token_key" in accounts_df.columns
+                else {}
+            )
+            token_summary = ", ".join(
+                f"{key}: {count}" for key, count in token_counts.items()
+            )
+            status.write(
+                f"Loaded {len(accounts_df)} relevant ad accounts from configured businesses/tokens"
+                + (f" ({token_summary})." if token_summary else ".")
+            )
 
             if accounts_df.empty:
                 st.error("No matching Okaby / VAL ad accounts found.")
