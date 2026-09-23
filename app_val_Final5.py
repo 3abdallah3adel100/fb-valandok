@@ -53,7 +53,18 @@ if not META_ACCESS_TOKENS:
     st.error("Missing Streamlit secret: META_ACCESS_TOKEN")
     st.stop()
 
-BUSINESS_IDS = ["751488620224306", "1178859133269743","1370772291128896"]
+BUSINESS_IDS = ["751488620224306", "1178859133269743", "1370772291128896"]
+# Include every account explicitly returned by these El-Okaby/Taher business endpoints,
+# regardless of the account name. The VAL business retains its name filter.
+OKABY_BUSINESS_IDS = {"751488620224306", "1370772291128896"}
+
+# Optional emergency mode for a token dedicated EXCLUSIVELY to the new business:
+# if its business endpoints are denied but /me/adaccounts works, set this to true
+# in Streamlit Secrets to include all token_2 /me accounts. Leave it false when
+# the second token can see unrelated ad accounts.
+INCLUDE_ALL_TOKEN_2_ME_ACCOUNTS = str(
+    st.secrets.get("INCLUDE_ALL_TOKEN_2_ME_ACCOUNTS", False)
+).strip().lower() in {"1", "true", "yes", "on"}
 FETCH_CAMPAIGNS = True  # Needed to fetch campaign status (Active / Not Active)
 REFRESH_LOCK_MAX_AGE_SECONDS = 10 * 60
 
@@ -148,7 +159,9 @@ def is_relevant_account_name(account_name: str) -> bool:
     )
 
 def source_is_okaby(source: str) -> bool:
-    return "751488620224306" in str(source)
+    """Match both actual El-Okaby business IDs, including aggregated source lists."""
+    source = str(source or "")
+    return any(f"business/{business_id}/" in source for business_id in OKABY_BUSINESS_IDS)
 
 def source_is_val(source: str) -> bool:
     return "1178859133269743" in str(source)
@@ -1012,7 +1025,10 @@ def fetch_all_pages(url, params=None):
 
     while True:
         response = requests.get(url, params=params, timeout=90)
-        response.raise_for_status()
+        if not response.ok:
+            # Do not propagate HTTPError with a URL containing access_token.
+            error = safe_meta_error(requests.HTTPError(response=response))
+            raise RuntimeError(error)
         data = response.json()
 
         all_rows.extend(data.get("data", []))
@@ -1027,21 +1043,40 @@ def fetch_all_pages(url, params=None):
 
     return all_rows
 
+def safe_meta_error(exc):
+    """Safe diagnostic without URLs, access tokens, or raw API payloads."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        message = str(exc)[:300] if isinstance(exc, RuntimeError) else type(exc).__name__
+        for token in META_ACCESS_TOKENS.values():
+            message = message.replace(token, "[REDACTED]")
+        return message
+    try:
+        error = response.json().get("error") or {}
+        message = str(error.get("message") or "")[:300]
+        for token in META_ACCESS_TOKENS.values():
+            message = message.replace(token, "[REDACTED]")
+        return (
+            f"HTTP {response.status_code} | code={error.get('code', '-')} "
+            f"subcode={error.get('error_subcode', '-')} | {message}"
+        )
+    except Exception:
+        return f"HTTP {response.status_code}"
+
+
 @st.cache_data(ttl=1800)
 def get_ad_accounts():
-    """Fetch relevant ad accounts across every configured Meta access token.
+    """Return (unique accounts, filtered raw sources, safe discovery diagnostics).
 
-    The dataframe stores only a safe token label (token_key), never the real token.
-    The token label is later used so each account's API calls use a token that can
-    actually access that account.
+    Real token strings are not stored in any resulting DataFrame or diagnostics.
     """
     all_dfs = []
+    diagnostics = []
 
     for token_key, access_token in META_ACCESS_TOKENS.items():
         sources = [
             ("me/adaccounts", f"{BASE_URL}/{API_VERSION}/me/adaccounts"),
         ]
-
         for business_id in BUSINESS_IDS:
             sources.extend([
                 (
@@ -1055,66 +1090,58 @@ def get_ad_accounts():
             ])
 
         for source_name, url in sources:
+            diagnostic = {
+                "token": token_key, "source": source_name,
+                "found": 0, "included": 0, "filtered": 0,
+                "status": "OK", "error": "",
+            }
             try:
-                params = {
+                rows = fetch_all_pages(url, {
                     "fields": "id,account_id,name,account_status,currency,funding_source_details",
                     "access_token": access_token,
                     "limit": 500,
-                }
-                rows = fetch_all_pages(url, params)
-                df = pd.DataFrame(rows)
-                if not df.empty:
+                })
+                diagnostic["found"] = len(rows)
+                if rows:
+                    df = pd.DataFrame(rows)
                     df["source"] = source_name
                     df["token_key"] = token_key
                     all_dfs.append(df)
-            except Exception:
-                # One token may not have access to one of the configured businesses.
-                # That should not block accounts available through the other token.
-                pass
+            except Exception as exc:
+                diagnostic["status"] = "ERROR"
+                diagnostic["error"] = safe_meta_error(exc)
+            diagnostics.append(diagnostic)
 
     if not all_dfs:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), diagnostics
 
     raw_accounts = pd.concat(all_dfs, ignore_index=True)
-
-    # Preserve the dashboard's existing account relevance rules:
-    # - All El-Okaby business accounts are kept, even with an unknown naming code.
-    # - VAL / other accounts are kept when their account names match the configured
-    #   naming patterns in is_relevant_account_name().
-    # - Matching accounts discovered via /me/adaccounts are also kept.
     if "name" in raw_accounts.columns:
         name_match = raw_accounts["name"].apply(is_relevant_account_name)
-        okaby_source = (
-            raw_accounts["source"].apply(source_is_okaby)
-            if "source" in raw_accounts.columns
-            else False
+        okaby_source = raw_accounts["source"].apply(source_is_okaby)
+        token_2_me = (
+            (raw_accounts["token_key"] == "token_2")
+            & (raw_accounts["source"] == "me/adaccounts")
+            & INCLUDE_ALL_TOKEN_2_ME_ACCOUNTS
         )
-        raw_accounts = raw_accounts[name_match | okaby_source].copy()
+        # Business 1370772291128896 is no longer discarded by the old name filter.
+        raw_accounts = raw_accounts[name_match | okaby_source | token_2_me].copy()
 
-    # The same ad account can appear through /me, a business endpoint, or both tokens.
-    # Keep one account row and retain the token_key of a token that successfully
-    # discovered it. token_1 wins when both tokens can see the same account.
-    token_priority = {key: i for i, key in enumerate(META_ACCESS_TOKENS.keys())}
-    raw_accounts["_token_priority"] = (
-        raw_accounts.get("token_key", pd.Series(index=raw_accounts.index, dtype=object))
-        .map(token_priority)
-        .fillna(999)
-    )
+    kept_counts = raw_accounts.groupby(["token_key", "source"]).size().to_dict()
+    for item in diagnostics:
+        item["included"] = int(kept_counts.get((item["token"], item["source"]), 0))
+        item["filtered"] = max(0, item["found"] - item["included"])
 
+    # Deduplicate by actual account ID, retaining a token label that discovered it.
+    priority = {key: idx for idx, key in enumerate(META_ACCESS_TOKENS)}
+    raw_accounts["_token_priority"] = raw_accounts["token_key"].map(priority).fillna(999)
     dedup = raw_accounts.copy()
-    sort_cols = [c for c in ["name", "_token_priority", "source"] if c in dedup.columns]
-    if sort_cols:
-        dedup = dedup.sort_values(sort_cols)
-
-    if "id" in dedup.columns:
-        dedup = dedup.drop_duplicates(subset=["id"], keep="first")
-    elif "account_id" in dedup.columns:
-        dedup = dedup.drop_duplicates(subset=["account_id"], keep="first")
-
+    dedup = dedup.sort_values(["name", "_token_priority", "source"])
+    dedup_id = "id" if "id" in dedup.columns else "account_id"
+    dedup = dedup.drop_duplicates(subset=[dedup_id], keep="first")
     dedup = dedup.drop(columns=["_token_priority"], errors="ignore")
     raw_accounts = raw_accounts.drop(columns=["_token_priority"], errors="ignore")
-
-    return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True)
+    return dedup.reset_index(drop=True), raw_accounts.reset_index(drop=True), diagnostics
 
 
 def get_meta_access_token(token_key):
@@ -1451,7 +1478,7 @@ def fetch_one_account(row, since, until):
         "gender_df": pd.DataFrame(),
         "age_df": pd.DataFrame(),
         "balance_row": {},
-        "error": f"{account_name}: {last_error}",
+        "error": f"{account_name}: {safe_meta_error(last_error) if last_error else 'Unknown error'}",
     }
 
 # -----------------------------
@@ -1657,7 +1684,7 @@ def add_business_unit_to_accounts(accounts_df):
         return accounts_df.copy()
     out = accounts_df.copy()
     name_col = "name" if "name" in out.columns else "account_name" if "account_name" in out.columns else None
-    source_col = "source" if "source" in out.columns else None
+    source_col = "source" if "source" in out.columns else "sources" if "sources" in out.columns else None
     if name_col is None:
         out["business_unit"] = "Unknown"
     else:
@@ -1674,10 +1701,17 @@ def assign_fact_business_unit_from_accounts(fact, accounts_df):
     if accounts_df.empty or "id" not in accounts_df.columns:
         return out
     acc_units = add_business_unit_to_accounts(accounts_df)
-    acc_units = acc_units[["id", "business_unit"]].drop_duplicates().rename(
-        columns={"id": "account_id", "business_unit": "account_business_unit"}
+    acc_units = acc_units[["id", "business_unit"]].copy()
+    # Graph Insights typically returns account_id without act_, while the
+    # business account endpoint returns id with act_. Normalize both sides.
+    acc_units["_account_id_clean"] = acc_units["id"].apply(normalize_account_id)
+    acc_units = (
+        acc_units.drop_duplicates(subset=["_account_id_clean"], keep="first")
+        [["_account_id_clean", "business_unit"]]
+        .rename(columns={"business_unit": "account_business_unit"})
     )
-    out = out.merge(acc_units, on="account_id", how="left")
+    out["_account_id_clean"] = out["account_id"].apply(normalize_account_id)
+    out = out.merge(acc_units, on="_account_id_clean", how="left")
 
     # Account classification is more reliable than campaign fallback.
     # If the account has a known unit, it overrides the campaign-based unit.
@@ -1688,7 +1722,7 @@ def assign_fact_business_unit_from_accounts(fact, accounts_df):
         axis=1,
     )
     out["business_unit"] = out["business_unit"].fillna("Unknown")
-    out = out.drop(columns=["account_business_unit"], errors="ignore")
+    out = out.drop(columns=["account_business_unit", "_account_id_clean"], errors="ignore")
     return out
 
 def filter_related_by_accounts(df, accounts_df):
@@ -1697,8 +1731,8 @@ def filter_related_by_accounts(df, accounts_df):
     id_col = "id" if "id" in accounts_df.columns else "account_id" if "account_id" in accounts_df.columns else None
     if id_col is None:
         return df.copy()
-    account_ids = set(accounts_df[id_col].dropna().astype(str).unique())
-    return df[df["account_id"].astype(str).isin(account_ids)].copy()
+    account_ids = set(accounts_df[id_col].dropna().apply(normalize_account_id).unique())
+    return df[df["account_id"].apply(normalize_account_id).isin(account_ids)].copy()
 
 def filter_accounts_by_business_unit(accounts_df, business_unit):
     if accounts_df.empty or business_unit == "All":
@@ -2249,6 +2283,7 @@ with st.sidebar:
     max_workers = st.slider("Parallel workers", min_value=2, max_value=10, value=4, step=2)
     show_account_sources = st.checkbox("Show account sources", value=True)
     refresh_clicked = st.button("Refresh Data", use_container_width=True)
+    diagnose_clicked = st.button("Diagnose Token / Business (no WhatsApp)", use_container_width=True)
     force_unlock_clicked = st.button("Clear stuck refresh lock", use_container_width=True)
 
     st.divider()
@@ -2257,6 +2292,21 @@ with st.sidebar:
 if force_unlock_clicked:
     force_clear_refresh_lock()
     st.success("Refresh lock cleared. You can click Refresh Data now.")
+
+if diagnose_clicked:
+    # Read-only Meta API discovery; this does not save a snapshot or queue WhatsApp.
+    st.cache_data.clear()
+    test_accounts, _test_sources, test_diagnostics = get_ad_accounts()
+    st.session_state["last_discovery_probe"] = {
+        "accounts": len(test_accounts), "diagnostics": test_diagnostics,
+    }
+
+if st.session_state.get("last_discovery_probe"):
+    probe = st.session_state["last_discovery_probe"]
+    st.subheader("Token / Business access check (no WhatsApp sent)")
+    st.write(f"Unique included ad accounts: {probe['accounts']}")
+    st.dataframe(pd.DataFrame(probe["diagnostics"]), use_container_width=True, hide_index=True)
+    st.caption("Found = Meta returned; Included = passed filter. Check token_2 and business/1370772291128896 rows.")
 
 if refresh_clicked:
     if not acquire_refresh_lock():
@@ -2272,7 +2322,18 @@ if refresh_clicked:
         old_snapshot = load_snapshot()
 
         with st.status("Refreshing data in background-like flow...", expanded=True) as status:
-            accounts_df, raw_accounts_df = get_ad_accounts()
+            # A manual Refresh must query Meta again, not reuse a 30-minute
+            # cache populated before the new token/business was added.
+            st.cache_data.clear()
+            accounts_df, raw_accounts_df, discovery_diagnostics = get_ad_accounts()
+            status.write("Discovery by token and source (found → included):")
+            for discovery in discovery_diagnostics:
+                status.write(
+                    f"{discovery['token']} | {discovery['source']}: "
+                    f"{discovery['found']} → {discovery['included']} "
+                    f"({discovery['status']})"
+                    + (f" | {discovery['error']}" if discovery['error'] else "")
+                )
             token_counts = (
                 accounts_df["token_key"].value_counts().to_dict()
                 if "token_key" in accounts_df.columns
@@ -2387,6 +2448,7 @@ if refresh_clicked:
                 "date_to": str(until),
                 "accounts_count": int(accounts_df["id"].nunique()),
                 "business_ids": BUSINESS_IDS,
+                "account_discovery": discovery_diagnostics,
                 "rows_count": int(len(fact)),
                 "errors_count": int(len(errors)),
                 "errors": errors[:100],
@@ -2440,6 +2502,18 @@ age_df = snapshot.get("age_df", pd.DataFrame())
 balance_df = snapshot.get("balance_df", pd.DataFrame())
 meta = snapshot["meta"]
 
+with st.expander("Meta account discovery diagnostics — Token 1 / Token 2", expanded=False):
+    diagnostics = meta.get("account_discovery", [])
+    if diagnostics:
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True, hide_index=True)
+        st.caption(
+            "Found = returned by Meta; Included = passed this app's account filter. "
+            "For the new business, check the owned/client rows for token_2. "
+            "Error messages intentionally omit access tokens."
+        )
+    else:
+        st.info("Click Refresh Data to collect source-level diagnostics.")
+
 last_updated_value = meta.get("last_fetch_ts", "-")
 st.caption(
     f"Last updated: {last_updated_value}"
@@ -2487,7 +2561,8 @@ if show_account_sources:
     st.subheader("Loaded Ad Accounts")
     shown_accounts = filter_accounts_by_business_unit(accounts_raw, selected_business_unit)
     if not shown_accounts.empty and {"name", "sources"}.issubset(shown_accounts.columns):
-        st.dataframe(shown_accounts[["name", "sources"]], use_container_width=True, hide_index=True)
+        visible_cols = [col for col in ["name", "sources", "token_keys"] if col in shown_accounts.columns]
+        st.dataframe(shown_accounts[visible_cols], use_container_width=True, hide_index=True)
 
 st.divider()
 
